@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -19,17 +20,35 @@ class GitNotesStore:
     NAMESPACES = {"tasks", "decisions", "context", "checkpoints", "metrics"}
     SCHEMA_VERSION = 1
 
-    def __init__(self, repo_root: Path) -> None:
+    def __init__(
+        self,
+        repo_root: Path,
+        *,
+        backend_mode: str = "notes",
+        branch_ref: str = "architect/state",
+    ) -> None:
         self.repo_root = repo_root.resolve()
         self.local_state_dir = self.repo_root / ".architect" / "state"
         self.local_state_dir.mkdir(parents=True, exist_ok=True)
         self.anchor_file = self.repo_root / ".architect" / "anchor"
         self.lock_file = self.local_state_dir / ".lock"
-        self._git_enabled = self._is_git_repo()
+        self._git_repo_available = self._is_git_repo()
+        self._requested_backend_mode = backend_mode
+        self._branch_ref = branch_ref
+        if backend_mode not in {"notes", "branch", "local"}:
+            raise ArchitectStateError(f"Unsupported state backend mode: {backend_mode}")
+        if backend_mode == "local" or not self._git_repo_available:
+            self._backend_mode = "local"
+        else:
+            self._backend_mode = backend_mode
 
     @property
     def git_enabled(self) -> bool:
-        return self._git_enabled
+        return self._backend_mode in {"notes", "branch"} and self._git_repo_available
+
+    @property
+    def backend_mode(self) -> str:
+        return self._backend_mode
 
     @staticmethod
     def _utcnow_iso() -> str:
@@ -48,6 +67,7 @@ class GitNotesStore:
         self,
         args: list[str],
         input_text: str | None = None,
+        env: dict[str, str] | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         proc = subprocess.run(
@@ -56,6 +76,7 @@ class GitNotesStore:
             text=True,
             capture_output=True,
             input=input_text,
+            env=env,
         )
         if check and proc.returncode != 0:
             raise ArchitectStateError(proc.stderr.strip() or proc.stdout.strip())
@@ -71,6 +92,88 @@ class GitNotesStore:
 
     def _notes_ref(self, namespace: str) -> str:
         return f"refs/notes/architect/{namespace}"
+
+    def _state_branch_ref(self) -> str:
+        if self._branch_ref.startswith("refs/"):
+            return self._branch_ref
+        return f"refs/heads/{self._branch_ref}"
+
+    def _state_branch_exists(self) -> bool:
+        proc = self._run_git(
+            ["show-ref", "--verify", "--quiet", self._state_branch_ref()],
+            check=False,
+        )
+        return proc.returncode == 0
+
+    def _read_branch_json(self, namespace: str) -> Any:
+        proc = self._run_git(
+            ["show", f"{self._state_branch_ref()}:{namespace}.json"],
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        content = proc.stdout.strip()
+        if not content:
+            return None
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return None
+
+    def _write_branch_json(self, namespace: str, serialized: str) -> None:
+        ref = self._state_branch_ref()
+        parent_commit: str | None = None
+        parent_tree: str | None = None
+        if self._state_branch_exists():
+            parent_commit = self._run_git(["rev-parse", ref], check=True).stdout.strip()
+            parent_tree = self._run_git(
+                ["rev-parse", f"{parent_commit}^{{tree}}"],
+                check=True,
+            ).stdout.strip()
+
+        with tempfile.NamedTemporaryFile(
+            prefix="architect-state-index-",
+            delete=False,
+        ) as index_file:
+            index_path = index_file.name
+
+        try:
+            env = os.environ.copy()
+            env["GIT_INDEX_FILE"] = index_path
+            try:
+                Path(index_path).unlink()
+            except FileNotFoundError:
+                pass
+            if parent_tree:
+                self._run_git(["read-tree", parent_tree], env=env, check=True)
+            blob_hash = self._run_git(
+                ["hash-object", "-w", "--stdin"],
+                input_text=serialized,
+                check=True,
+            ).stdout.strip()
+            index_info = f"100644 blob {blob_hash}\t{namespace}.json\n"
+            self._run_git(
+                ["update-index", "--index-info"],
+                input_text=index_info,
+                env=env,
+                check=True,
+            )
+            new_tree = self._run_git(["write-tree"], env=env, check=True).stdout.strip()
+            commit_args = ["commit-tree", new_tree]
+            if parent_commit:
+                commit_args.extend(["-p", parent_commit])
+            commit_message = f"architect-state: update {namespace}\n"
+            commit_hash = self._run_git(
+                commit_args,
+                input_text=commit_message,
+                check=True,
+            ).stdout.strip()
+            self._run_git(["update-ref", ref, commit_hash], check=True)
+        finally:
+            try:
+                os.unlink(index_path)
+            except OSError:
+                pass
 
     def _anchor_object(self) -> str:
         if not self.git_enabled:
@@ -110,7 +213,7 @@ class GitNotesStore:
                 pass
 
     def _read_raw_json(self, namespace: str) -> Any:
-        if self.git_enabled:
+        if self.git_enabled and self.backend_mode == "notes":
             anchor = self._anchor_object()
             proc = self._run_git(
                 ["notes", "--ref", self._notes_ref(namespace), "show", anchor],
@@ -125,6 +228,8 @@ class GitNotesStore:
                 return json.loads(content)
             except json.JSONDecodeError:
                 return None
+        if self.git_enabled and self.backend_mode == "branch":
+            return self._read_branch_json(namespace)
 
         local_file = self._local_file(namespace)
         if not local_file.exists():
@@ -136,7 +241,7 @@ class GitNotesStore:
 
     def _write_raw_json(self, namespace: str, payload: Any) -> None:
         serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        if self.git_enabled:
+        if self.git_enabled and self.backend_mode == "notes":
             anchor = self._anchor_object()
             self._run_git(
                 [
@@ -151,6 +256,9 @@ class GitNotesStore:
                 ],
                 check=True,
             )
+            return
+        if self.git_enabled and self.backend_mode == "branch":
+            self._write_branch_json(namespace, serialized)
             return
         self._local_file(namespace).write_text(serialized, encoding="utf-8")
 

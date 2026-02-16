@@ -159,18 +159,97 @@ class ResilientBackend(AgentBackend):
         user_prompt: str,
         allowed_tools: list[str],
     ) -> dict[str, Any]:
-        chunks = await self._execute_attempts(
-            "execute_with_tools",
-            lambda backend: self._collect_chunks(
-                backend,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                context={"tool_mode": True},
-                tools=allowed_tools,
-            ),
+        attempts: list[tuple[str, AgentBackend]] = [(self.primary_name, self.primary_backend)]
+        if self.fallback_name != self.primary_name:
+            attempts.append((self.fallback_name, self.fallback_backend))
+
+        errors: list[str] = []
+        for backend_name, backend in attempts:
+            for attempt in range(self.retry_policy.max_retries + 1):
+                is_retry = attempt > 0
+                if is_retry:
+                    delay = self.retry_policy.backoff_seconds * (2 ** (attempt - 1))
+                    self._emit(
+                        {
+                            "event": "backend_retry",
+                            "backend": backend_name,
+                            "attempt": attempt,
+                            "delay_seconds": delay,
+                            "call": "execute_with_tools",
+                        }
+                    )
+                    await asyncio.sleep(delay)
+                try:
+                    payload = await asyncio.wait_for(
+                        backend.execute_with_tools(
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            allowed_tools=allowed_tools,
+                        ),
+                        timeout=self.retry_policy.timeout_seconds,
+                    )
+                    if backend_name != self.primary_name:
+                        self._emit(
+                            {
+                                "event": "backend_fallback_success",
+                                "backend": backend_name,
+                                "attempt": attempt,
+                                "call": "execute_with_tools",
+                            }
+                        )
+                    if not isinstance(payload, dict):
+                        payload = {"content": str(payload)}
+                    payload["allowed_tools"] = allowed_tools
+                    return payload
+                except TimeoutError as exc:
+                    error = BackendTimeoutError(
+                        (
+                            "Backend request timed out after "
+                            f"{self.retry_policy.timeout_seconds:.1f}s"
+                        ),
+                        retriable=True,
+                    )
+                    errors.append(f"{backend_name}[{attempt}]: {error}")
+                    self._emit(
+                        {
+                            "event": "backend_attempt_failed",
+                            "backend": backend_name,
+                            "attempt": attempt,
+                            "call": "execute_with_tools",
+                            "error": str(error),
+                            "retriable": True,
+                        }
+                    )
+                    _ = exc
+                except BackendExecutionError as exc:
+                    errors.append(f"{backend_name}[{attempt}]: {exc}")
+                    self._emit(
+                        {
+                            "event": "backend_attempt_failed",
+                            "backend": backend_name,
+                            "attempt": attempt,
+                            "call": "execute_with_tools",
+                            "error": str(exc),
+                            "retriable": exc.retriable,
+                        }
+                    )
+                    if not exc.retriable:
+                        break
+                except Exception as exc:
+                    errors.append(f"{backend_name}[{attempt}]: {exc}")
+                    self._emit(
+                        {
+                            "event": "backend_attempt_failed",
+                            "backend": backend_name,
+                            "attempt": attempt,
+                            "call": "execute_with_tools",
+                            "error": str(exc),
+                            "retriable": True,
+                        }
+                    )
+
+        summary = "; ".join(errors[-6:])
+        raise BackendExecutionError(
+            f"All backend attempts failed for execute_with_tools. {summary}",
+            retriable=False,
         )
-        return {
-            "backend": "resilient",
-            "content": "".join(chunks).strip(),
-            "allowed_tools": allowed_tools,
-        }

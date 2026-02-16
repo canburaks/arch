@@ -21,8 +21,13 @@ max_patches_before_review = 5
 auto_test = true
 auto_lint = true
 require_critic_approval = true
+test_coverage_threshold = 0
 
 [guardrails]
 max_file_changes_per_patch = 10
 forbidden_paths = [".env", "secrets/*", "production.config.*"]
 require_tests_for = ["src/**/*.py"]
+
+[state]
+backend = "notes"
+branch_ref = "architect/state"

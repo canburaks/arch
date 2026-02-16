@@ -67,3 +67,29 @@ def test_update_json_increments_revision(tmp_path: Path) -> None:
 
     assert store.get_json("metrics")["count"] == 2
     assert second_revision > first_revision
+
+
+def test_git_branch_state_backend_roundtrip(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    store = GitNotesStore(
+        repo,
+        backend_mode="branch",
+        branch_ref="architect/state-test",
+    )
+    payload = {"goal": "branch-state", "phase": "planning"}
+    store.set_json("context", payload)
+
+    assert store.git_enabled is True
+    assert store.backend_mode == "branch"
+    assert store.get_json("context") == payload
+
+    show_ref = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", "refs/heads/architect/state-test"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+    )
+    assert show_ref.returncode == 0

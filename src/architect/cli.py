@@ -23,6 +23,7 @@ from architect.specialists import (
     DocumenterAgent,
     PlannerAgent,
     SpecialistAgent,
+    SupervisorAgent,
     TesterAgent,
 )
 from architect.state import GitNotesStore, PatchStackManager
@@ -95,25 +96,33 @@ def _build_backend(
     )
 
 
-def _build_specialists(backend: ResilientBackend) -> dict[str, SpecialistAgent]:
+def _build_specialists(
+    backend: ResilientBackend, config: ArchitectConfig
+) -> dict[str, SpecialistAgent]:
     return {
-        "planner": PlannerAgent(backend),
-        "coder": CoderAgent(backend),
-        "tester": TesterAgent(backend),
-        "critic": CriticAgent(backend),
-        "documenter": DocumenterAgent(backend),
+        "planner": PlannerAgent(backend, model=config.agents.specialist_model),
+        "coder": CoderAgent(backend, model=config.agents.specialist_model),
+        "tester": TesterAgent(backend, model=config.agents.specialist_model),
+        "critic": CriticAgent(backend, model=config.agents.specialist_model),
+        "documenter": DocumenterAgent(backend, model=config.agents.specialist_model),
     }
 
 
 def _load_runtime(repo_root: Path, config_path: Path) -> Runtime:
     config = load_config(config_path)
-    state = GitNotesStore(repo_root)
+    state = GitNotesStore(
+        repo_root,
+        backend_mode=config.state.backend,
+        branch_ref=config.state.branch_ref,
+    )
     patches = PatchStackManager(repo_root, state_store=state)
     backend = _build_backend(config, repo_root, state)
+    supervisor_agent = SupervisorAgent(backend, model=config.agents.supervisor_model)
     supervisor = Supervisor(
         state_store=state,
         patch_manager=patches,
-        specialists=_build_specialists(backend),
+        specialists=_build_specialists(backend, config),
+        supervisor_agent=supervisor_agent,
         config=config,
         repo_root=repo_root,
     )
@@ -166,6 +175,36 @@ def _patch_metadata(state: GitNotesStore, commit_hash: str) -> dict[str, Any]:
     return {}
 
 
+def _session_commit_scope(state: GitNotesStore) -> set[str]:
+    context = state.get_context()
+    run_id = context.get("current_run_id")
+    session = context.get("session", {})
+    commit_hashes: set[str] = set()
+    if isinstance(session, dict):
+        patch_stack = session.get("patch_stack", [])
+        if isinstance(patch_stack, list):
+            for item in patch_stack:
+                if isinstance(item, dict):
+                    commit_hash = item.get("commit_hash")
+                    if isinstance(commit_hash, str):
+                        commit_hashes.add(commit_hash)
+    if commit_hashes:
+        return commit_hashes
+
+    metrics = state.get_metrics()
+    patch_stack = metrics.get("patch_stack", [])
+    if isinstance(patch_stack, list):
+        for item in patch_stack:
+            if not isinstance(item, dict):
+                continue
+            if run_id and item.get("run_id") != run_id:
+                continue
+            commit_hash = item.get("commit_hash")
+            if isinstance(commit_hash, str):
+                commit_hashes.add(commit_hash)
+    return commit_hashes
+
+
 @click.group()
 def cli() -> None:
     """Architect CLI."""
@@ -184,7 +223,11 @@ def init_command(backend: str | None, config_value: str) -> None:
 
     (repo_root / ".architect").mkdir(parents=True, exist_ok=True)
 
-    state = GitNotesStore(repo_root)
+    state = GitNotesStore(
+        repo_root,
+        backend_mode=config.state.backend,
+        branch_ref=config.state.branch_ref,
+    )
     patches = PatchStackManager(repo_root, state_store=state)
     if not state.get_context():
         state.set_context(
@@ -206,7 +249,7 @@ def init_command(backend: str | None, config_value: str) -> None:
     click.echo(f"Config: {config_path}")
     click.echo(f"Backend: {config.backend.primary}")
     click.echo(
-        f"Git notes enabled: {'yes' if state.git_enabled else 'no (using local .architect/state)'}"
+        f"State backend: {state.backend_mode}"
     )
 
 
@@ -218,6 +261,49 @@ def run_command(goal: str, config_value: str) -> None:
     runtime = _load_runtime(repo_root, _resolve_config_path(repo_root, config_value))
     try:
         summary = asyncio.run(runtime.supervisor.run(goal))
+    except (RuntimeError, ArchitectStateError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Goal complete: {summary.goal}")
+    click.echo(f"Run ID: {summary.run_id}")
+    click.echo(f"Tasks: {summary.completed_tasks}/{summary.total_tasks}")
+    if summary.checkpoint_id:
+        click.echo(f"Checkpoint: {summary.checkpoint_id}")
+
+
+@cli.command("pause")
+@click.option("--config", "config_value", default="architect.toml", show_default=True)
+def pause_command(config_value: str) -> None:
+    repo_root = Path.cwd().resolve()
+    runtime = _load_runtime(repo_root, _resolve_config_path(repo_root, config_value))
+    runtime.supervisor.pause()
+    click.echo("Workflow paused.")
+
+
+@cli.command("resume")
+@click.option("--from-checkpoint", "checkpoint_id", default=None)
+@click.option("--goal", "goal_override", default=None)
+@click.option("--config", "config_value", default="architect.toml", show_default=True)
+def resume_command(checkpoint_id: str | None, goal_override: str | None, config_value: str) -> None:
+    repo_root = Path.cwd().resolve()
+    runtime = _load_runtime(repo_root, _resolve_config_path(repo_root, config_value))
+
+    if checkpoint_id:
+        try:
+            branch_name = runtime.patches.rollback(checkpoint_id)
+        except ArchitectStateError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(f"Restored checkpoint on branch: {branch_name}")
+
+    runtime.supervisor.resume()
+    context = runtime.state.get_context()
+    goal = goal_override or str(context.get("goal") or "").strip()
+    if not goal:
+        click.echo("Workflow resumed.")
+        return
+
+    try:
+        summary = asyncio.run(runtime.supervisor.run(goal, resume=True))
     except (RuntimeError, ArchitectStateError) as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -240,17 +326,19 @@ def status_command(verbose: bool, config_value: str) -> None:
 
 @cli.command("review")
 @click.option("--patch", "patch_ref", default=None)
+@click.option("--all", "include_all", is_flag=True, default=False)
 @click.option("--config", "config_value", default="architect.toml", show_default=True)
-def review_command(patch_ref: str | None, config_value: str) -> None:
+def review_command(patch_ref: str | None, include_all: bool, config_value: str) -> None:
     repo_root = Path.cwd().resolve()
     runtime = _load_runtime(repo_root, _resolve_config_path(repo_root, config_value))
-    patches = runtime.patches.list_patches()
+    scope = None if include_all else (_session_commit_scope(runtime.state) or None)
+    patches = runtime.patches.list_patches(commit_hashes=scope)
     if not patches:
         click.echo("No patches available.")
         return
 
     if patch_ref:
-        patch = runtime.patches.resolve_patch(patch_ref)
+        patch = runtime.patches.resolve_patch(patch_ref, commit_hashes=scope)
         if patch is None:
             raise click.ClickException(f"Patch not found: {patch_ref}")
         description = runtime.patches.describe_patch(patch.patch_id)
@@ -268,11 +356,13 @@ def review_command(patch_ref: str | None, config_value: str) -> None:
 
 @cli.command("accept")
 @click.argument("patch_ref")
+@click.option("--all", "include_all", is_flag=True, default=False)
 @click.option("--config", "config_value", default="architect.toml", show_default=True)
-def accept_command(patch_ref: str, config_value: str) -> None:
+def accept_command(patch_ref: str, include_all: bool, config_value: str) -> None:
     repo_root = Path.cwd().resolve()
     runtime = _load_runtime(repo_root, _resolve_config_path(repo_root, config_value))
-    patch = runtime.patches.resolve_patch(patch_ref)
+    scope = None if include_all else (_session_commit_scope(runtime.state) or None)
+    patch = runtime.patches.resolve_patch(patch_ref, commit_hashes=scope)
     if patch is None:
         raise click.ClickException(f"Patch not found: {patch_ref}")
 
@@ -297,12 +387,14 @@ def accept_command(patch_ref: str, config_value: str) -> None:
 
 @cli.command("reject")
 @click.argument("patch_ref")
+@click.option("--all", "include_all", is_flag=True, default=False)
 @click.option("--config", "config_value", default="architect.toml", show_default=True)
-def reject_command(patch_ref: str, config_value: str) -> None:
+def reject_command(patch_ref: str, include_all: bool, config_value: str) -> None:
     repo_root = Path.cwd().resolve()
     runtime = _load_runtime(repo_root, _resolve_config_path(repo_root, config_value))
+    scope = None if include_all else (_session_commit_scope(runtime.state) or None)
     try:
-        patch = runtime.patches.reject_patch(patch_ref)
+        patch = runtime.patches.reject_patch(patch_ref, commit_hashes=scope)
     except ArchitectStateError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -323,11 +415,13 @@ def reject_command(patch_ref: str, config_value: str) -> None:
 
 @cli.command("modify")
 @click.argument("patch_ref")
+@click.option("--all", "include_all", is_flag=True, default=False)
 @click.option("--config", "config_value", default="architect.toml", show_default=True)
-def modify_command(patch_ref: str, config_value: str) -> None:
+def modify_command(patch_ref: str, include_all: bool, config_value: str) -> None:
     repo_root = Path.cwd().resolve()
     runtime = _load_runtime(repo_root, _resolve_config_path(repo_root, config_value))
-    patch = runtime.patches.resolve_patch(patch_ref)
+    scope = None if include_all else (_session_commit_scope(runtime.state) or None)
+    patch = runtime.patches.resolve_patch(patch_ref, commit_hashes=scope)
     if patch is None:
         raise click.ClickException(f"Patch not found: {patch_ref}")
 
@@ -386,10 +480,10 @@ def rollback_command(checkpoint_id: str, config_value: str) -> None:
     repo_root = Path.cwd().resolve()
     runtime = _load_runtime(repo_root, _resolve_config_path(repo_root, config_value))
     try:
-        runtime.patches.rollback(checkpoint_id)
+        branch_name = runtime.patches.rollback(checkpoint_id)
     except ArchitectStateError as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Rolled back to {checkpoint_id}")
+    click.echo(f"Checked out rollback branch: {branch_name}")
 
 
 @cli.command("checkpoints")
