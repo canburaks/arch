@@ -33,6 +33,19 @@ CI validates:
 - Lint
 - Tests
 - Package build
+- Package metadata validation (`twine check`)
 - CLI install smoke check
 
 If your change affects packaging or entrypoints, ensure smoke checks still pass.
+
+## PyPI Publishing
+
+The repository includes `.github/workflows/publish.yml`, which:
+
+1. Triggers on `v*` tags.
+2. Verifies tag version matches `pyproject.toml`.
+3. Builds distributions.
+4. Validates distributions with `twine check`.
+5. Publishes to PyPI via trusted publishing.
+
+Before first publish, configure trusted publishing on PyPI for this repository.

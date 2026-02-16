@@ -20,7 +20,7 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --extra dev --extra release
 
       - name: Lint
         run: uv run --extra dev ruff check src tests
@@ -30,6 +30,9 @@ jobs:
 
       - name: Build package
         run: uv build
+
+      - name: Validate package metadata
+        run: uv run --extra release twine check dist/*
 
       - name: Install smoke check
         run: |
