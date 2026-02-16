@@ -1,0 +1,9 @@
+.architect/
+.pytest_cache/
+__pycache__/
+.ruff_cache/
+*.pyc
+dist/
+.venv/
+.coverage
+.mypy_cache/
