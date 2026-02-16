@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "archcli"
+version = "0.1.0"
+description = "Architect: a system-agnostic multi-agent developer orchestration CLI."
+readme = "docs/README.md"
+requires-python = ">=3.11"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development",
+]
+dependencies = [
+  "click>=8.1.7",
+]
+[project.urls]
+Documentation = "https://github.com/canburak/aiteam/tree/main/docs"
+Repository = "https://github.com/canburak/aiteam"
+Issues = "https://github.com/canburak/aiteam/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "ruff>=0.8.0",
+]
+release = [
+  "build>=1.2.2",
+  "twine>=5.1.1",
+]
+
+[project.scripts]
+arch = "architect.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/architect"]
+
+[tool.hatch.build]
+artifacts = [
+  "src/architect/prompts/*.md",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
