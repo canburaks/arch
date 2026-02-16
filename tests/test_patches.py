@@ -58,3 +58,42 @@ def test_patch_status_persisted_in_state(tmp_path: Path) -> None:
 
     assert refreshed is not None
     assert refreshed.status == "accepted"
+
+
+def test_reject_patch_uses_non_destructive_revert(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo_with_commits(repo)
+
+    state = GitNotesStore(repo)
+    manager = PatchStackManager(repo, state_store=state)
+    patch = manager.list_patches()[-1]
+
+    rejected = manager.reject_patch(patch.patch_id)
+    assert rejected.commit_hash == patch.commit_hash
+
+    refreshed = manager.resolve_patch(patch.patch_id)
+    assert refreshed is not None
+    assert refreshed.status == "rejected"
+
+    subject = _run(["git", "log", "-1", "--pretty=%s"], cwd=repo)
+    assert subject.startswith("Revert")
+
+
+def test_rollback_checks_out_safe_branch(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo_with_commits(repo)
+
+    state = GitNotesStore(repo)
+    manager = PatchStackManager(repo, state_store=state)
+    checkpoint = manager.create_checkpoint("before-rollback")
+
+    (repo / "c.txt").write_text("c\n", encoding="utf-8")
+    _run(["git", "add", "c.txt"], cwd=repo)
+    _run(["git", "commit", "-m", "third"], cwd=repo)
+
+    branch_name = manager.rollback(checkpoint)
+    assert branch_name.startswith("architect/rollback-")
+    current_branch = _run(["git", "branch", "--show-current"], cwd=repo)
+    assert current_branch == branch_name

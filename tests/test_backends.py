@@ -102,3 +102,28 @@ def test_resilient_backend_fallback_and_retry_events() -> None:
     event_names = [event["event"] for event in events]
     assert "backend_retry" in event_names
     assert "backend_fallback_success" in event_names
+
+
+def test_resilient_backend_execute_with_tools_fallback() -> None:
+    events: list[dict[str, Any]] = []
+    backend = ResilientBackend(
+        primary_name="primary",
+        primary_backend=AlwaysFailBackend(),
+        fallback_name="fallback",
+        fallback_backend=SuccessBackend(),
+        retry_policy=RetryPolicy(max_retries=1, backoff_seconds=0.0, timeout_seconds=5.0),
+        event_hook=events.append,
+    )
+
+    payload = asyncio.run(
+        backend.execute_with_tools(
+            system_prompt="system",
+            user_prompt="user",
+            allowed_tools=["read_file"],
+        )
+    )
+
+    assert payload["content"] == "ok"
+    event_names = [event["event"] for event in events]
+    assert "backend_retry" in event_names
+    assert "backend_fallback_success" in event_names

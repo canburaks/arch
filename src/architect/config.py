@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 BackendName = Literal["codex", "claude"]
+StateBackendName = Literal["notes", "branch", "local"]
 
 
 @dataclass(slots=True)
@@ -39,6 +40,7 @@ class WorkflowConfig:
     auto_test: bool = True
     auto_lint: bool = True
     require_critic_approval: bool = True
+    test_coverage_threshold: int = 0
 
 
 @dataclass(slots=True)
@@ -51,12 +53,19 @@ class GuardrailsConfig:
 
 
 @dataclass(slots=True)
+class StateConfig:
+    backend: StateBackendName = "notes"
+    branch_ref: str = "architect/state"
+
+
+@dataclass(slots=True)
 class ArchitectConfig:
     project: ProjectConfig = field(default_factory=ProjectConfig)
     backend: BackendConfig = field(default_factory=BackendConfig)
     agents: AgentsConfig = field(default_factory=AgentsConfig)
     workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
     guardrails: GuardrailsConfig = field(default_factory=GuardrailsConfig)
+    state: StateConfig = field(default_factory=StateConfig)
 
     @classmethod
     def default(cls) -> ArchitectConfig:
@@ -70,6 +79,7 @@ class ArchitectConfig:
             agents=AgentsConfig(**data.get("agents", {})),
             workflow=WorkflowConfig(**data.get("workflow", {})),
             guardrails=GuardrailsConfig(**data.get("guardrails", {})),
+            state=StateConfig(**data.get("state", {})),
         )
 
     def to_dict(self) -> dict:
@@ -97,11 +107,16 @@ class ArchitectConfig:
                 "auto_test": self.workflow.auto_test,
                 "auto_lint": self.workflow.auto_lint,
                 "require_critic_approval": self.workflow.require_critic_approval,
+                "test_coverage_threshold": self.workflow.test_coverage_threshold,
             },
             "guardrails": {
                 "max_file_changes_per_patch": self.guardrails.max_file_changes_per_patch,
                 "forbidden_paths": list(self.guardrails.forbidden_paths),
                 "require_tests_for": list(self.guardrails.require_tests_for),
+            },
+            "state": {
+                "backend": self.state.backend,
+                "branch_ref": self.state.branch_ref,
             },
         }
 
@@ -122,7 +137,7 @@ def _toml_value(value: object) -> str:
 def dumps_toml(config: ArchitectConfig) -> str:
     data = config.to_dict()
     lines: list[str] = []
-    section_order = ["project", "backend", "agents", "workflow", "guardrails"]
+    section_order = ["project", "backend", "agents", "workflow", "guardrails", "state"]
     for section in section_order:
         lines.append(f"[{section}]")
         for key, value in data[section].items():

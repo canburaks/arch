@@ -31,7 +31,7 @@ class FakeBackend(AgentBackend):
         if "Design a technical approach" in user_prompt:
             yield "- Implement core flow\n- Add validation"
             return
-        if "Review quality/security" in user_prompt:
+        if "Review quality/security" in user_prompt or "Review implementation chunk" in user_prompt:
             yield "MINOR: Naming could be improved"
             return
         yield f"done: {user_prompt}"
@@ -142,3 +142,23 @@ def test_guardrail_require_tests_for_detects_missing_tests(tmp_path: Path) -> No
     passed, _reason = supervisor._assert_guardrail_test_coverage(["src/architect/cli.py"])  # noqa: SLF001
 
     assert passed is False
+
+
+def test_supervisor_can_skip_critic_when_not_required(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    config = ArchitectConfig.default()
+    config.workflow.require_critic_approval = False
+    config.workflow.max_patches_before_review = 1
+    config.project.lint_command = "python -c \"print('lint ok')\""
+    config.project.type_check_command = "python -c \"print('type ok')\""
+    config.project.test_command = "python -c \"print('test ok')\""
+
+    supervisor = _build_supervisor(repo, config)
+    summary = asyncio.run(supervisor.run("Build JWT auth"))
+    status = supervisor.status(verbose=True)
+
+    assert summary.completed_tasks >= 4
+    assert not any(task["type"] == "review" for task in status["tasks"])

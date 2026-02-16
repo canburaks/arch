@@ -23,7 +23,7 @@ class FakeBackend(AgentBackend):
         if "Design a technical approach" in user_prompt:
             yield "- Create implementation artifact\n- Validate behavior"
             return
-        if "Review quality/security" in user_prompt:
+        if "Review quality/security" in user_prompt or "Review implementation chunk" in user_prompt:
             yield "MINOR: All checks passed"
             return
         yield f"done: {user_prompt}"
@@ -133,6 +133,7 @@ def test_cli_full_lifecycle_commands(tmp_path: Path, monkeypatch) -> None:
 
     second_review_result = runner.invoke(cli, ["review"])
     assert second_review_result.exit_code == 0
+    assert patch_id not in second_review_result.output
     second_patch_id = _extract_patch_id(second_review_result.output)
     assert re.match(r"patch-[0-9a-f]{8}", second_patch_id)
 
@@ -181,3 +182,43 @@ def test_accept_rejects_forbidden_paths(tmp_path: Path, monkeypatch) -> None:
     accept_result = runner.invoke(cli, ["accept", commit_hash[:8]])
     assert accept_result.exit_code != 0
     assert "forbidden path" in accept_result.output.lower()
+
+
+def test_pause_resume_and_resume_from_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        "architect.cli._build_backend", lambda config, repo_root, state: FakeBackend()
+    )
+    runner = CliRunner()
+
+    init_result = runner.invoke(cli, ["init"])
+    assert init_result.exit_code == 0
+    _set_safe_commands(repo / "architect.toml")
+
+    pause_result = runner.invoke(cli, ["pause"])
+    assert pause_result.exit_code == 0
+
+    blocked_run = runner.invoke(cli, ["run", "Should be blocked"])
+    assert blocked_run.exit_code != 0
+    assert "paused" in blocked_run.output.lower()
+
+    resume_result = runner.invoke(cli, ["resume"])
+    assert resume_result.exit_code == 0
+
+    first_run = runner.invoke(cli, ["run", "Implement workflow"])
+    assert first_run.exit_code == 0
+
+    checkpoints_result = runner.invoke(cli, ["checkpoints"])
+    assert checkpoints_result.exit_code == 0
+    checkpoint_id = _extract_checkpoint_id(checkpoints_result.output)
+
+    resume_checkpoint = runner.invoke(
+        cli,
+        ["resume", "--from-checkpoint", checkpoint_id, "--goal", "Implement resumed workflow"],
+    )
+    assert resume_checkpoint.exit_code == 0
+    assert "Restored checkpoint" in resume_checkpoint.output

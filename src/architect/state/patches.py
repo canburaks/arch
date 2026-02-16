@@ -143,7 +143,11 @@ class PatchStackManager:
     def create_branch(self, branch_name: str, start_point: str = "HEAD") -> None:
         self._run_git(["checkout", "-B", branch_name, start_point], check=True)
 
-    def list_patches(self, base_ref: str | None = None) -> list[Patch]:
+    def list_patches(
+        self,
+        base_ref: str | None = None,
+        commit_hashes: set[str] | None = None,
+    ) -> list[Patch]:
         if not self.git_enabled:
             return []
         range_part = f"{base_ref}..HEAD" if base_ref else "HEAD"
@@ -177,6 +181,8 @@ class PatchStackManager:
         for _index, line in enumerate(proc.stdout.splitlines(), start=1):
             commit_hash, _, subject = line.partition("\t")
             commit_hash = commit_hash.strip()
+            if commit_hashes is not None and commit_hash not in commit_hashes:
+                continue
             patch_id = patch_index.get(commit_hash) if isinstance(patch_index, dict) else None
             if not isinstance(patch_id, str) or not patch_id:
                 patch_id = self._patch_id_for_commit(commit_hash)
@@ -206,8 +212,13 @@ class PatchStackManager:
                 patch.patch_id = self._patch_id_for_commit(patch.commit_hash)
         return patches
 
-    def resolve_patch(self, patch_ref: str, base_ref: str | None = None) -> Patch | None:
-        patches = self.list_patches(base_ref=base_ref)
+    def resolve_patch(
+        self,
+        patch_ref: str,
+        base_ref: str | None = None,
+        commit_hashes: set[str] | None = None,
+    ) -> Patch | None:
+        patches = self.list_patches(base_ref=base_ref, commit_hashes=commit_hashes)
 
         # Legacy positional reference support.
         if patch_ref.startswith("patch-") and patch_ref[6:].isdigit():
@@ -331,27 +342,63 @@ class PatchStackManager:
         commit_hash = self._run_git(["rev-parse", "HEAD"], check=True).stdout.strip()
         return self.record_patch(commit_hash, subject, task_id, status="pending", run_id=run_id)
 
-    def reject_patch(self, patch_ref: str, base_ref: str | None = None) -> Patch:
-        patch = self.resolve_patch(patch_ref, base_ref=base_ref)
+    def _staged_files(self) -> list[str]:
+        proc = self._run_git(["diff", "--cached", "--name-only"], check=False)
+        if proc.returncode != 0:
+            return []
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+    def create_task_patch_from_worktree(
+        self,
+        *,
+        subject: str,
+        body: str,
+        task_id: str,
+        run_id: str,
+        fallback_file: Path | None = None,
+        fallback_content: str | None = None,
+    ) -> Patch:
+        if not self.git_enabled:
+            raise ArchitectStateError("Creating a patch requires a git repository.")
+        self._run_git(["add", "-A", "--", ".", ":(exclude).architect/**"], check=True)
+        staged = self._staged_files()
+        if not staged:
+            if fallback_file is None or fallback_content is None:
+                raise ArchitectStateError("No repository changes detected for patch creation.")
+            fallback_file.parent.mkdir(parents=True, exist_ok=True)
+            fallback_file.write_text(fallback_content, encoding="utf-8")
+            rel_path = fallback_file.relative_to(self.repo_root)
+            self._run_git(["add", str(rel_path)], check=True)
+            staged = self._staged_files()
+            if not staged:
+                raise ArchitectStateError("Failed to stage fallback patch artifact.")
+        self._run_git(["commit", "-m", subject, "-m", body], check=True)
+        commit_hash = self._run_git(["rev-parse", "HEAD"], check=True).stdout.strip()
+        return self.record_patch(commit_hash, subject, task_id, status="pending", run_id=run_id)
+
+    def reject_patch(
+        self,
+        patch_ref: str,
+        base_ref: str | None = None,
+        commit_hashes: set[str] | None = None,
+    ) -> Patch:
+        patch = self.resolve_patch(patch_ref, base_ref=base_ref, commit_hashes=commit_hashes)
         if patch is None:
             raise ArchitectStateError(f"Patch not found: {patch_ref}")
 
-        head_before = self._run_git(["rev-parse", "HEAD"], check=True).stdout.strip()
-        parent_proc = self._run_git(["rev-parse", f"{patch.commit_hash}^"], check=True)
-        parent_hash = parent_proc.stdout.strip()
-        branch_name = self.current_branch()
-        rebase_proc = self._run_git(
-            ["rebase", "--onto", parent_hash, patch.commit_hash, branch_name],
+        revert_proc = self._run_git(
+            ["revert", "--no-edit", patch.commit_hash],
             check=False,
         )
-        if rebase_proc.returncode != 0:
-            self._run_git(["rebase", "--abort"], check=False)
-            self._run_git(["reset", "--hard", head_before], check=False)
-            raise ArchitectStateError(
-                "Reject failed due to rebase conflict. Repository restored to previous HEAD."
-            )
+        if revert_proc.returncode != 0:
+            self._run_git(["revert", "--abort"], check=False)
+            raise ArchitectStateError("Reject failed due to revert conflict. Resolve manually.")
 
-        self.update_patch_status(patch.commit_hash, "rejected", note="Removed via rebase --onto")
+        self.update_patch_status(
+            patch.commit_hash,
+            "rejected",
+            note="Rejected via non-destructive revert",
+        )
         return patch
 
     def _read_local_checkpoints(self) -> list[str]:
@@ -403,7 +450,12 @@ class PatchStackManager:
             return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
         return self._read_local_checkpoints()
 
-    def rollback(self, checkpoint_id: str) -> None:
+    def rollback(self, checkpoint_id: str) -> str:
         if not self.git_enabled:
             raise ArchitectStateError("Rollback requires a git repository.")
-        self._run_git(["reset", "--hard", checkpoint_id], check=True)
+        safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", checkpoint_id)
+        rollback_branch = (
+            f"architect/rollback-{safe_name}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
+        )
+        self._run_git(["checkout", "-b", rollback_branch, checkpoint_id], check=True)
+        return rollback_branch
