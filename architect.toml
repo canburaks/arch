@@ -1,0 +1,28 @@
+[project]
+name = "my-project"
+language = "python"
+test_command = "uv run --extra dev pytest -q"
+lint_command = "uv run --extra dev ruff check src tests"
+type_check_command = "python -m compileall src tests"
+
+[backend]
+primary = "codex"
+fallback = "codex"
+max_retries = 1
+retry_backoff_seconds = 0.5
+timeout_seconds = 90
+
+[agents]
+supervisor_model = "gpt-5.3-codex"
+specialist_model = "gpt-5.3-codex"
+
+[workflow]
+max_patches_before_review = 5
+auto_test = true
+auto_lint = true
+require_critic_approval = true
+
+[guardrails]
+max_file_changes_per_patch = 10
+forbidden_paths = [".env", "secrets/*", "production.config.*"]
+require_tests_for = ["src/**/*.py"]
