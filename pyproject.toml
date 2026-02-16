@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "archcli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Architect: a system-agnostic multi-agent developer orchestration CLI."
 readme = "docs/README.md"
 requires-python = ">=3.11"
