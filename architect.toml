@@ -18,9 +18,20 @@ specialist_model = "gpt-5.3-codex"
 
 [workflow]
 max_patches_before_review = 5
+max_parallel_tasks = 1
 auto_test = true
 auto_lint = true
 require_critic_approval = true
+plan_requires_critic = false
+review_max_major_findings = -1
+review_require_docs_update = true
+review_require_changelog_update = false
+branch_strategy = "single_branch_queue"
+task_max_attempts = 2
+task_retry_backoff_seconds = 0
+max_conflict_cycles = 2
+fallback_artifact_mode = "local_only"
+tracked_fallback_dir = "docs/architect-runs"
 test_coverage_threshold = 0
 
 [guardrails]

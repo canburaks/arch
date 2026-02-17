@@ -17,7 +17,7 @@ class ArchitectStateError(RuntimeError):
 
 
 class GitNotesStore:
-    NAMESPACES = {"tasks", "decisions", "context", "checkpoints", "metrics"}
+    NAMESPACES = {"tasks", "decisions", "context", "checkpoints", "metrics", "leases", "runs"}
     SCHEMA_VERSION = 1
 
     def __init__(
@@ -398,3 +398,17 @@ class GitNotesStore:
 
     def set_metrics(self, metrics: dict[str, Any]) -> None:
         self.set_json("metrics", metrics)
+
+    def get_leases(self) -> dict[str, Any]:
+        leases = self.get_json("leases", default={})
+        return leases if isinstance(leases, dict) else {}
+
+    def set_leases(self, leases: dict[str, Any]) -> None:
+        self.set_json("leases", leases)
+
+    def get_runs(self) -> dict[str, Any]:
+        runs = self.get_json("runs", default={})
+        return runs if isinstance(runs, dict) else {}
+
+    def set_runs(self, runs: dict[str, Any]) -> None:
+        self.set_json("runs", runs)

@@ -11,6 +11,9 @@ def test_config_roundtrip(tmp_path: Path) -> None:
     config.backend.max_retries = 3
     config.project.type_check_command = "python -m compileall src tests"
     config.workflow.test_coverage_threshold = 80
+    config.workflow.max_parallel_tasks = 3
+    config.workflow.plan_requires_critic = True
+    config.workflow.branch_strategy = "auxiliary_branches"
     config.state.backend = "branch"
     config.state.branch_ref = "architect/state-test"
 
@@ -23,6 +26,9 @@ def test_config_roundtrip(tmp_path: Path) -> None:
     assert loaded.backend.max_retries == 3
     assert "compileall" in loaded.project.type_check_command
     assert loaded.workflow.test_coverage_threshold == 80
+    assert loaded.workflow.max_parallel_tasks == 3
+    assert loaded.workflow.plan_requires_critic is True
+    assert loaded.workflow.branch_strategy == "auxiliary_branches"
     assert loaded.state.backend == "branch"
     assert loaded.state.branch_ref == "architect/state-test"
 
@@ -34,4 +40,7 @@ def test_toml_dump_contains_backend_retry_fields() -> None:
     assert "retry_backoff_seconds" in rendered
     assert "timeout_seconds" in rendered
     assert "test_coverage_threshold" in rendered
+    assert "max_parallel_tasks" in rendered
+    assert "branch_strategy" in rendered
+    assert "fallback_artifact_mode" in rendered
     assert "[state]" in rendered

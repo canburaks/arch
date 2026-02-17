@@ -6,8 +6,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-BackendName = Literal["codex", "claude"]
+BackendName = Literal["codex", "claude", "codex_sdk", "auto"]
 StateBackendName = Literal["notes", "branch", "local"]
+BranchStrategy = Literal["single_branch_queue", "auxiliary_branches"]
+FallbackArtifactMode = Literal["local_only", "tracked"]
 
 
 @dataclass(slots=True)
@@ -37,9 +39,20 @@ class AgentsConfig:
 @dataclass(slots=True)
 class WorkflowConfig:
     max_patches_before_review: int = 5
+    max_parallel_tasks: int = 1
     auto_test: bool = True
     auto_lint: bool = True
     require_critic_approval: bool = True
+    plan_requires_critic: bool = False
+    review_max_major_findings: int = -1
+    review_require_docs_update: bool = True
+    review_require_changelog_update: bool = False
+    branch_strategy: BranchStrategy = "single_branch_queue"
+    task_max_attempts: int = 2
+    task_retry_backoff_seconds: float = 0.0
+    max_conflict_cycles: int = 2
+    fallback_artifact_mode: FallbackArtifactMode = "local_only"
+    tracked_fallback_dir: str = "docs/architect-runs"
     test_coverage_threshold: int = 0
 
 
@@ -104,9 +117,20 @@ class ArchitectConfig:
             },
             "workflow": {
                 "max_patches_before_review": self.workflow.max_patches_before_review,
+                "max_parallel_tasks": self.workflow.max_parallel_tasks,
                 "auto_test": self.workflow.auto_test,
                 "auto_lint": self.workflow.auto_lint,
                 "require_critic_approval": self.workflow.require_critic_approval,
+                "plan_requires_critic": self.workflow.plan_requires_critic,
+                "review_max_major_findings": self.workflow.review_max_major_findings,
+                "review_require_docs_update": self.workflow.review_require_docs_update,
+                "review_require_changelog_update": self.workflow.review_require_changelog_update,
+                "branch_strategy": self.workflow.branch_strategy,
+                "task_max_attempts": self.workflow.task_max_attempts,
+                "task_retry_backoff_seconds": self.workflow.task_retry_backoff_seconds,
+                "max_conflict_cycles": self.workflow.max_conflict_cycles,
+                "fallback_artifact_mode": self.workflow.fallback_artifact_mode,
+                "tracked_fallback_dir": self.workflow.tracked_fallback_dir,
                 "test_coverage_threshold": self.workflow.test_coverage_threshold,
             },
             "guardrails": {

@@ -2,7 +2,10 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from architect.state import GitNotesStore, PatchStackManager
+from architect.state.git_notes import ArchitectStateError
 
 
 def _run(cmd: list[str], cwd: Path) -> str:
@@ -97,3 +100,29 @@ def test_rollback_checks_out_safe_branch(tmp_path: Path) -> None:
     assert branch_name.startswith("architect/rollback-")
     current_branch = _run(["git", "branch", "--show-current"], cwd=repo)
     assert current_branch == branch_name
+
+
+def test_precommit_guardrail_blocks_forbidden_paths_before_commit(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo_with_commits(repo)
+
+    state = GitNotesStore(repo)
+    manager = PatchStackManager(repo, state_store=state)
+    before_head = _run(["git", "rev-parse", "HEAD"], cwd=repo)
+
+    (repo / ".env").write_text("TOKEN=1\n", encoding="utf-8")
+
+    with pytest.raises(ArchitectStateError, match="Pre-commit guardrail failed"):
+        manager.create_task_patch_from_worktree(
+            subject="architect: forbidden",
+            body="test",
+            task_id="task-implement-999",
+            run_id="run-guardrail",
+            fallback_mode="local_only",
+            max_files=10,
+            forbidden_paths=[".env"],
+        )
+
+    after_head = _run(["git", "rev-parse", "HEAD"], cwd=repo)
+    assert before_head == after_head

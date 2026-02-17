@@ -13,6 +13,7 @@ import click
 from architect.backends import (
     ClaudeCodeBackend,
     CodexBackend,
+    CodexSDKBackend,
     ResilientBackend,
     RetryPolicy,
 )
@@ -49,10 +50,17 @@ def _resolve_config_path(repo_root: Path, config_value: str) -> Path:
 
 
 def _build_single_backend(
-    backend_name: BackendName, repo_root: Path
-) -> CodexBackend | ClaudeCodeBackend:
+    backend_name: BackendName, repo_root: Path, state: GitNotesStore
+) -> CodexBackend | ClaudeCodeBackend | CodexSDKBackend:
+    def event_hook(event: dict[str, Any]) -> None:
+        _record_backend_event(state, event)
+
+    if backend_name == "auto":
+        return CodexSDKBackend(working_directory=repo_root)
+    if backend_name == "codex_sdk":
+        return CodexSDKBackend(working_directory=repo_root)
     if backend_name == "codex":
-        return CodexBackend(working_directory=repo_root)
+        return CodexBackend(working_directory=repo_root, event_hook=event_hook)
     return ClaudeCodeBackend(working_directory=repo_root)
 
 
@@ -79,8 +87,8 @@ def _build_backend(
 ) -> ResilientBackend:
     primary_name = config.backend.primary
     fallback_name = config.backend.fallback
-    primary_backend = _build_single_backend(primary_name, repo_root)
-    fallback_backend = _build_single_backend(fallback_name, repo_root)
+    primary_backend = _build_single_backend(primary_name, repo_root, state)
+    fallback_backend = _build_single_backend(fallback_name, repo_root, state)
     policy = RetryPolicy(
         max_retries=max(0, int(config.backend.max_retries)),
         backoff_seconds=max(0.0, float(config.backend.retry_backoff_seconds)),
@@ -211,7 +219,11 @@ def cli() -> None:
 
 
 @cli.command("init")
-@click.option("--backend", type=click.Choice(["codex", "claude"]), default=None)
+@click.option(
+    "--backend",
+    type=click.Choice(["auto", "codex", "codex_sdk", "claude"]),
+    default=None,
+)
 @click.option("--config", "config_value", default="architect.toml", show_default=True)
 def init_command(backend: str | None, config_value: str) -> None:
     repo_root = Path.cwd().resolve()
@@ -255,12 +267,27 @@ def init_command(backend: str | None, config_value: str) -> None:
 
 @cli.command("run")
 @click.argument("goal")
+@click.option("--resume-run", is_flag=True, default=False)
+@click.option("--max-parallel-tasks", type=int, default=None)
+@click.option("--autonomous/--manual", "autonomous", default=True)
 @click.option("--config", "config_value", default="architect.toml", show_default=True)
-def run_command(goal: str, config_value: str) -> None:
+def run_command(
+    goal: str,
+    resume_run: bool,
+    max_parallel_tasks: int | None,
+    autonomous: bool,
+    config_value: str,
+) -> None:
     repo_root = Path.cwd().resolve()
     runtime = _load_runtime(repo_root, _resolve_config_path(repo_root, config_value))
+    if max_parallel_tasks is not None:
+        runtime.config.workflow.max_parallel_tasks = max(1, int(max_parallel_tasks))
+    if not autonomous:
+        runtime.config.workflow.task_max_attempts = 1
+        runtime.config.workflow.max_conflict_cycles = 0
+
     try:
-        summary = asyncio.run(runtime.supervisor.run(goal))
+        summary = asyncio.run(runtime.supervisor.run(goal, resume=resume_run))
     except (RuntimeError, ArchitectStateError) as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -369,7 +396,19 @@ def accept_command(patch_ref: str, include_all: bool, config_value: str) -> None
     patch_files = runtime.patches.changed_files_for_commit(patch.commit_hash)
     _ensure_patch_allowed(patch_files, runtime.config)
 
-    runtime.patches.update_patch_status(patch.commit_hash, "accepted")
+    finalization = runtime.patches.finalize_accepted_patch(
+        patch,
+        strategy=runtime.config.workflow.branch_strategy,
+    )
+    runtime.patches.update_patch_status(
+        patch.commit_hash,
+        "accepted",
+        note=f"Finalized via {finalization.get('strategy')}",
+    )
+    runtime.patches.update_patch_metadata(
+        patch.commit_hash,
+        {"finalization": finalization},
+    )
     _record_patch_metric(runtime.state, "accepted_patches", patch.commit_hash)
     runtime.state.add_decision(
         {
@@ -378,11 +417,18 @@ def accept_command(patch_ref: str, include_all: bool, config_value: str) -> None
             "decided_by": "user",
             "approved_by": "supervisor",
             "decision": f"Accepted patch {patch.patch_id}",
-            "rationale": "Patch passed review and guardrail validation.",
+            "rationale": (
+                "Patch passed review and guardrail validation and was "
+                f"finalized with {finalization.get('strategy')} strategy."
+            ),
+            "metadata": {"finalization": finalization},
             "created_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
         }
     )
-    click.echo(f"Accepted {patch.patch_id} ({patch.commit_hash[:10]})")
+    click.echo(
+        f"Accepted {patch.patch_id} ({patch.commit_hash[:10]}), "
+        f"tag={finalization.get('tag')}"
+    )
 
 
 @cli.command("reject")
@@ -399,6 +445,40 @@ def reject_command(patch_ref: str, include_all: bool, config_value: str) -> None
         raise click.ClickException(str(exc)) from exc
 
     _record_patch_metric(runtime.state, "rejected_patches", patch.commit_hash)
+    tasks = runtime.state.get_tasks()
+    existing_attempts = [
+        int(task.get("retry_attempt", 0))
+        for task in tasks
+        if isinstance(task, dict) and task.get("origin_commit") == patch.commit_hash
+    ]
+    retry_attempt = max(existing_attempts, default=0) + 1
+    retry_task_id = f"task-retry-{patch.commit_hash[:8]}-{retry_attempt:02d}"
+    if not any(
+        isinstance(task, dict)
+        and task.get("id") == retry_task_id
+        and str(task.get("status", "pending")) in {"pending", "in_progress", "failed"}
+        for task in tasks
+    ):
+        tasks.append(
+            {
+                "id": retry_task_id,
+                "type": "implement",
+                "assigned_to": "coder",
+                "description": (
+                    f"Retry rejected patch {patch.patch_id} ({patch.commit_hash[:10]}). "
+                    "Re-implement with corrections."
+                ),
+                "status": "pending",
+                "depends_on": [],
+                "created_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+                "attempt": 0,
+                "origin_patch_id": patch.patch_id,
+                "origin_commit": patch.commit_hash,
+                "retry_attempt": retry_attempt,
+            }
+        )
+        runtime.state.set_tasks(tasks)
+
     runtime.state.add_decision(
         {
             "id": f"dec-reject-{patch.commit_hash[:8]}",
@@ -406,11 +486,18 @@ def reject_command(patch_ref: str, include_all: bool, config_value: str) -> None
             "decided_by": "user",
             "approved_by": "supervisor",
             "decision": f"Rejected patch {patch.patch_id}",
-            "rationale": "Patch removed from stack via reject workflow.",
+            "rationale": "Patch removed from stack via reject workflow and queued for retry.",
+            "metadata": {
+                "retry_task_id": retry_task_id,
+                "retry_attempt": retry_attempt,
+            },
             "created_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
         }
     )
-    click.echo(f"Rejected {patch.patch_id} ({patch.commit_hash[:10]})")
+    click.echo(
+        f"Rejected {patch.patch_id} ({patch.commit_hash[:10]}). "
+        f"Queued retry task: {retry_task_id}"
+    )
 
 
 @cli.command("modify")
@@ -426,26 +513,39 @@ def modify_command(patch_ref: str, include_all: bool, config_value: str) -> None
         raise click.ClickException(f"Patch not found: {patch_ref}")
 
     branch_name = None
-    if runtime.patches.git_enabled:
+    if (
+        runtime.patches.git_enabled
+        and runtime.config.workflow.branch_strategy == "auxiliary_branches"
+    ):
         branch_name = (
             f"architect/amend-{patch.patch_id}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
         )
         runtime.patches.create_branch(branch_name, start_point=patch.commit_hash)
 
     tasks = runtime.state.get_tasks()
-    tasks.append(
-        {
-            "id": f"task-modify-{patch.commit_hash[:8]}",
-            "type": "implement",
-            "assigned_to": "coder",
-            "description": f"Amend patch {patch.patch_id} ({patch.commit_hash[:10]}).",
-            "status": "pending",
-            "depends_on": [],
-            "created_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
-            "attempt": 0,
-        }
+    task_id = f"task-modify-{patch.commit_hash[:8]}"
+    should_append = not any(
+        isinstance(task, dict)
+        and task.get("id") == task_id
+        and str(task.get("status", "pending")) in {"pending", "in_progress", "failed"}
+        for task in tasks
     )
-    runtime.state.set_tasks(tasks)
+    if should_append:
+        tasks.append(
+            {
+                "id": task_id,
+                "type": "implement",
+                "assigned_to": "coder",
+                "description": f"Amend patch {patch.patch_id} ({patch.commit_hash[:10]}).",
+                "status": "pending",
+                "depends_on": [],
+                "created_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+                "attempt": 0,
+                "origin_patch_id": patch.patch_id,
+                "origin_commit": patch.commit_hash,
+            }
+        )
+        runtime.state.set_tasks(tasks)
 
     runtime.patches.update_patch_status(patch.commit_hash, "modified")
     runtime.state.add_decision(
@@ -470,6 +570,8 @@ def modify_command(patch_ref: str, include_all: bool, config_value: str) -> None
     message = f"Marked {patch.patch_id} for modification."
     if branch_name:
         message += f" Amendment branch: {branch_name}"
+    else:
+        message += " Branch strategy: single_branch_queue."
     click.echo(message)
 
 
@@ -500,7 +602,7 @@ def checkpoints_command(config_value: str) -> None:
 
 
 @cli.command("backend")
-@click.argument("backend_name", type=click.Choice(["codex", "claude"]))
+@click.argument("backend_name", type=click.Choice(["auto", "codex", "codex_sdk", "claude"]))
 @click.option("--config", "config_value", default="architect.toml", show_default=True)
 def backend_command(backend_name: str, config_value: str) -> None:
     repo_root = Path.cwd().resolve()

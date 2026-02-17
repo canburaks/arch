@@ -31,6 +31,9 @@ dev = [
   "pytest>=8.0.0",
   "ruff>=0.8.0",
 ]
+codex_sdk = [
+  "openai>=1.0.0",
+]
 release = [
   "build>=1.2.2",
   "twine>=5.1.1",
