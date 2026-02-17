@@ -9,6 +9,7 @@ from architect.backends import RetryPolicy
 from architect.backends.base import AgentBackend, BackendExecutionError
 from architect.backends.claude import ClaudeCodeBackend
 from architect.backends.codex import CodexBackend
+from architect.backends.codex_sdk import CodexSDKBackend
 from architect.backends.resilient import ResilientBackend
 
 
@@ -60,15 +61,19 @@ def test_codex_build_command_shape() -> None:
     command = backend.build_command(
         system_prompt="system",
         user_prompt="implement feature",
-        context={"goal": "x"},
+        context={"goal": "x", "model": "gpt-5-codex"},
         tools=["read", "write"],
     )
 
     assert command[0:2] == ["codex", "exec"]
-    assert "--output-format" in command
-    assert "jsonl" in command
-    assert any(part.startswith("system_prompt=") for part in command)
-    assert command[-1] == "implement feature"
+    assert "--json" in command
+    assert "--output-format" not in command
+    assert "-m" in command
+    assert "gpt-5-codex" in command
+    assert any(part.startswith("instructions=") for part in command)
+    assert "implement feature" in command[-1]
+    assert "Context JSON:" in command[-1]
+    assert "Allowed tools:" in command[-1]
 
 
 def test_claude_build_command_shape() -> None:
@@ -102,6 +107,7 @@ def test_resilient_backend_fallback_and_retry_events() -> None:
 
     assert output == "ok"
     event_names = [event["event"] for event in events]
+    assert "backend_failover_start" in event_names
     assert "backend_retry" in event_names
     assert "backend_fallback_success" in event_names
 
@@ -158,6 +164,7 @@ def test_codex_backend_emits_stream_telemetry(monkeypatch: pytest.MonkeyPatch) -
             self.stdout = FakeStdout(
                 [
                     b"{\"type\":\"response.output_text.delta\",\"content\":\"hello\"}\n",
+                    b"noise-before-json\n",
                     b"{\"type\":\"response.completed\"}\n",
                 ]
             )
@@ -186,4 +193,36 @@ def test_codex_backend_emits_stream_telemetry(monkeypatch: pytest.MonkeyPatch) -
     event_names = [event.get("event") for event in events]
     assert "codex_cli_start" in event_names
     assert "codex_json_event" in event_names
+    assert "codex_json_parse_fallback" in event_names
     assert "codex_cli_exit" in event_names
+
+
+def test_codex_sdk_uses_context_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeResponses:
+        def create(self, **kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            return {"output_text": "ok"}
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+
+    backend = CodexSDKBackend(model="gpt-5-codex")
+    monkeypatch.setattr(backend, "_client", FakeClient())
+
+    async def _run() -> str:
+        chunks: list[str] = []
+        async for chunk in backend.execute(
+            system_prompt="system",
+            user_prompt="user",
+            context={"model": "gpt-5.3-codex"},
+        ):
+            chunks.append(chunk)
+        return "".join(chunks)
+
+    output = asyncio.run(_run())
+
+    assert output == "ok"
+    assert captured["model"] == "gpt-5.3-codex"

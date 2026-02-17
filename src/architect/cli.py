@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import importlib.util
 import json
+import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +42,96 @@ class Runtime:
     state: GitNotesStore
     patches: PatchStackManager
     supervisor: Supervisor
+
+
+def _module_available(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
+
+
+def _node_runner(repo_root: Path) -> str:
+    if (repo_root / "pnpm-lock.yaml").exists():
+        return "pnpm"
+    if (repo_root / "yarn.lock").exists():
+        return "yarn"
+    return "npm"
+
+
+def _node_run_command(runner: str, script_name: str) -> str:
+    if runner == "yarn":
+        return f"yarn {script_name}"
+    return f"{runner} run {script_name}"
+
+
+def _apply_detected_defaults(config: ArchitectConfig, repo_root: Path) -> None:
+    if (repo_root / "package.json").exists():
+        package_json = json.loads((repo_root / "package.json").read_text(encoding="utf-8"))
+        scripts = package_json.get("scripts", {})
+        if not isinstance(scripts, dict):
+            scripts = {}
+        runner = _node_runner(repo_root)
+        config.project.language = "javascript"
+        config.workflow.auto_test = "test" in scripts
+        config.workflow.auto_lint = "lint" in scripts
+        if "test" in scripts:
+            config.project.test_command = _node_run_command(runner, "test")
+        if "lint" in scripts:
+            config.project.lint_command = _node_run_command(runner, "lint")
+        if "typecheck" in scripts:
+            config.project.type_check_command = _node_run_command(runner, "typecheck")
+        elif "check" in scripts:
+            config.project.type_check_command = _node_run_command(runner, "check")
+        else:
+            config.project.type_check_command = ""
+        config.guardrails.require_tests_for = ["**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx"]
+        return
+
+    if (repo_root / "go.mod").exists():
+        config.project.language = "go"
+        config.workflow.auto_test = True
+        config.workflow.auto_lint = True
+        config.project.test_command = "go test ./..."
+        config.project.lint_command = "go vet ./..."
+        config.project.type_check_command = "go test ./..."
+        config.guardrails.require_tests_for = ["**/*.go"]
+        return
+
+    if (repo_root / "Cargo.toml").exists():
+        config.project.language = "rust"
+        config.workflow.auto_test = True
+        config.workflow.auto_lint = True
+        config.project.test_command = "cargo test"
+        config.project.lint_command = "cargo check --all-targets --all-features"
+        config.project.type_check_command = "cargo check --all-targets --all-features"
+        config.guardrails.require_tests_for = ["**/*.rs"]
+        return
+
+    has_python_markers = any(
+        (repo_root / marker).exists()
+        for marker in (
+            "pyproject.toml",
+            "requirements.txt",
+            "requirements-dev.txt",
+            "setup.py",
+            "setup.cfg",
+        )
+    )
+    if not has_python_markers:
+        return
+
+    config.project.language = "python"
+    if shutil.which("uv"):
+        config.project.test_command = "uv run --extra dev pytest -q"
+        config.project.lint_command = "uv run --extra dev ruff check src tests"
+        config.project.type_check_command = "python -m compileall src tests"
+        config.workflow.auto_test = True
+        config.workflow.auto_lint = True
+    else:
+        config.project.test_command = "python -m pytest -q"
+        config.project.lint_command = "python -m compileall src tests"
+        config.project.type_check_command = "python -m compileall src tests"
+        config.workflow.auto_test = _module_available("pytest")
+        config.workflow.auto_lint = True
+    config.guardrails.require_tests_for = ["**/*.py"]
 
 
 def _resolve_config_path(repo_root: Path, config_value: str) -> Path:
@@ -228,7 +320,10 @@ def cli() -> None:
 def init_command(backend: str | None, config_value: str) -> None:
     repo_root = Path.cwd().resolve()
     config_path = _resolve_config_path(repo_root, config_value)
+    is_new_config = not config_path.exists()
     config = load_config(config_path)
+    if is_new_config:
+        _apply_detected_defaults(config, repo_root)
     if backend:
         config.backend.primary = backend  # type: ignore[assignment]
     save_config(config_path, config)

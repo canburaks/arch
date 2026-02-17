@@ -126,3 +126,58 @@ def test_precommit_guardrail_blocks_forbidden_paths_before_commit(tmp_path: Path
 
     after_head = _run(["git", "rev-parse", "HEAD"], cwd=repo)
     assert before_head == after_head
+
+
+def test_local_patch_lifecycle_without_git(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    state = GitNotesStore(repo, backend_mode="local")
+    manager = PatchStackManager(repo, state_store=state)
+    assert manager.git_enabled is False
+
+    patch = manager.record_local_patch(
+        subject="architect: task-implement-001",
+        task_id="task-implement-001",
+        run_id="run-local",
+        files_changed=[".architect/runs/run-local/task-implement-001.md"],
+    )
+
+    patches = manager.list_patches()
+    assert len(patches) == 1
+    assert patches[0].patch_id == patch.patch_id
+    assert manager.describe_patch(patch.patch_id)
+
+    rejected = manager.reject_patch(patch.patch_id)
+    assert rejected.status == "rejected"
+
+    checkpoint = manager.create_checkpoint("local")
+    rollback_target = manager.rollback(checkpoint)
+    assert rollback_target.startswith("local/")
+
+
+def test_create_task_patch_can_exclude_paths(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo_with_commits(repo)
+
+    state = GitNotesStore(repo)
+    manager = PatchStackManager(repo, state_store=state)
+
+    (repo / "a.txt").write_text("dirty-a\n", encoding="utf-8")
+    (repo / "b.txt").write_text("dirty-b\n", encoding="utf-8")
+
+    patch = manager.create_task_patch_from_worktree(
+        subject="architect: exclude-paths",
+        body="exclude dirty paths",
+        task_id="task-implement-exclude",
+        run_id="run-exclude",
+        fallback_mode="local_only",
+        exclude_paths=["a.txt"],
+    )
+
+    changed = manager.changed_files_for_commit(patch.commit_hash)
+    assert "b.txt" in changed
+    assert "a.txt" not in changed
+    unstaged = _run(["git", "diff", "--name-only"], cwd=repo)
+    assert "a.txt" in unstaged

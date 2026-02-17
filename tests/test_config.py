@@ -1,5 +1,7 @@
+import tomllib
 from pathlib import Path
 
+from architect import __version__
 from architect.config import ArchitectConfig, dumps_toml, load_config, save_config
 
 
@@ -14,6 +16,9 @@ def test_config_roundtrip(tmp_path: Path) -> None:
     config.workflow.max_parallel_tasks = 3
     config.workflow.plan_requires_critic = True
     config.workflow.branch_strategy = "auxiliary_branches"
+    config.workflow.dirty_worktree_mode = "isolate"
+    config.workflow.review_docs_patterns = ["guides/**"]
+    config.workflow.review_changelog_patterns = ["history/**"]
     config.state.backend = "branch"
     config.state.branch_ref = "architect/state-test"
 
@@ -29,6 +34,9 @@ def test_config_roundtrip(tmp_path: Path) -> None:
     assert loaded.workflow.max_parallel_tasks == 3
     assert loaded.workflow.plan_requires_critic is True
     assert loaded.workflow.branch_strategy == "auxiliary_branches"
+    assert loaded.workflow.dirty_worktree_mode == "isolate"
+    assert loaded.workflow.review_docs_patterns == ["guides/**"]
+    assert loaded.workflow.review_changelog_patterns == ["history/**"]
     assert loaded.state.backend == "branch"
     assert loaded.state.branch_ref == "architect/state-test"
 
@@ -43,4 +51,14 @@ def test_toml_dump_contains_backend_retry_fields() -> None:
     assert "max_parallel_tasks" in rendered
     assert "branch_strategy" in rendered
     assert "fallback_artifact_mode" in rendered
+    assert "dirty_worktree_mode" in rendered
+    assert "review_docs_patterns" in rendered
+    assert "review_changelog_patterns" in rendered
     assert "[state]" in rendered
+
+
+def test_package_version_constant_matches_pyproject() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert __version__ == pyproject["project"]["version"]

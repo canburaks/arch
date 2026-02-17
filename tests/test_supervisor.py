@@ -16,7 +16,7 @@ from architect.specialists import (
     TesterAgent,
 )
 from architect.state import GitNotesStore, PatchStackManager
-from architect.supervisor import Supervisor
+from architect.supervisor import Supervisor, WorkTask
 
 
 class FakeBackend(AgentBackend):
@@ -174,6 +174,21 @@ def test_guardrail_require_tests_for_detects_missing_tests(tmp_path: Path) -> No
     assert passed is False
 
 
+def test_guardrail_require_tests_for_accepts_spec_style_tests(tmp_path: Path) -> None:
+    config = ArchitectConfig.default()
+    config.guardrails.require_tests_for = ["packages/**/*.ts"]
+    supervisor = _build_supervisor(tmp_path, config)
+
+    passed, _reason = supervisor._assert_guardrail_test_coverage(  # noqa: SLF001
+        [
+            "packages/core/index.ts",
+            "spec/core/index.spec.ts",
+        ]
+    )
+
+    assert passed is True
+
+
 def test_supervisor_can_skip_critic_when_not_required(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -227,3 +242,201 @@ def test_plan_gate_can_enforce_critic_blockers(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="Planning gate failed due to critic blockers"):
         asyncio.run(supervisor.run("Build JWT auth"))
+
+
+def test_path_classifiers_detect_docs_and_tests(tmp_path: Path) -> None:
+    supervisor = _build_supervisor(tmp_path, ArchitectConfig.default())
+
+    assert supervisor._is_test_path("packages/api/user.test.ts")  # noqa: SLF001
+    assert supervisor._is_test_path("spec/auth/login.spec.ts")  # noqa: SLF001
+    assert supervisor._is_test_path("tests/test_login.py")  # noqa: SLF001
+    assert supervisor._is_documentation_path("README.md")  # noqa: SLF001
+    assert supervisor._is_documentation_path("docs/api.md")  # noqa: SLF001
+    assert supervisor._is_internal_runtime_path(".architect/runs/run/task.md")  # noqa: SLF001
+    assert not supervisor._is_documentation_path("src/auth/service.py")  # noqa: SLF001
+    assert supervisor._is_documentation_evidence_path("guides/overview.txt") is False  # noqa: SLF001
+
+
+def test_documentation_evidence_uses_configured_patterns(tmp_path: Path) -> None:
+    config = ArchitectConfig.default()
+    config.workflow.review_docs_patterns = ["guides/**"]
+    supervisor = _build_supervisor(tmp_path, config)
+
+    assert supervisor._is_documentation_evidence_path("guides/overview.txt")  # noqa: SLF001
+
+
+def test_supervisor_parses_structured_review_findings(tmp_path: Path) -> None:
+    supervisor = _build_supervisor(tmp_path, ArchitectConfig.default())
+    findings = supervisor._parse_review_findings('{"counts":{"BLOCKER":1,"MAJOR":2}}')  # noqa: SLF001
+
+    assert findings["BLOCKER"] == 1
+    assert findings["MAJOR"] == 2
+    assert findings["MINOR"] == 0
+
+
+def test_supervisor_parses_structured_coverage_payload(tmp_path: Path) -> None:
+    supervisor = _build_supervisor(tmp_path, ArchitectConfig.default())
+    percent = supervisor._extract_coverage_percent(  # noqa: SLF001
+        {"stdout_tail": '{"coverage_percent":87}', "stderr_tail": ""}
+    )
+
+    assert percent == 87
+
+
+def test_supervisor_preflight_fails_when_required_command_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = ArchitectConfig.default()
+    config.project.lint_command = "python -c \"print('lint ok')\""
+    config.project.type_check_command = "python -c \"print('type ok')\""
+    config.project.test_command = "python -c \"print('test ok')\""
+    supervisor = _build_supervisor(tmp_path, config)
+    monkeypatch.setattr(
+        supervisor,
+        "_command_available",
+        lambda executable: executable != "python",
+    )
+
+    with pytest.raises(RuntimeError, match="Runtime preflight failed"):
+        asyncio.run(supervisor.run("Build JWT auth"))
+
+    status = supervisor.status(verbose=True)
+    preflight = status["metrics"]["preflight"]
+    assert preflight["ok"] is False
+    assert any("python" in message for message in preflight["errors"])
+    assert status["context"]["preflight"]["ok"] is False
+
+
+def test_supervisor_preflight_records_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = ArchitectConfig.default()
+    config.project.lint_command = "python -c \"print('lint ok')\""
+    config.project.type_check_command = "python -c \"print('type ok')\""
+    config.project.test_command = "python -c \"print('test ok')\""
+    supervisor = _build_supervisor(tmp_path, config)
+    monkeypatch.setattr(supervisor, "_command_available", lambda executable: True)
+
+    summary = asyncio.run(supervisor.run("Build JWT auth"))
+    status = supervisor.status(verbose=True)
+
+    assert summary.completed_tasks >= 5
+    assert status["metrics"]["preflight"]["ok"] is True
+    assert status["context"]["preflight"]["ok"] is True
+
+
+def test_supervisor_preflight_warns_when_fallback_is_same_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = ArchitectConfig.default()
+    config.backend.primary = "codex"
+    config.backend.fallback = "codex"
+    config.project.lint_command = "python -c \"print('lint ok')\""
+    config.project.type_check_command = "python -c \"print('type ok')\""
+    config.project.test_command = "python -c \"print('test ok')\""
+    supervisor = _build_supervisor(tmp_path, config)
+    monkeypatch.setattr(supervisor, "_command_available", lambda executable: True)
+
+    asyncio.run(supervisor.run("Build JWT auth"))
+    status = supervisor.status(verbose=True)
+
+    warnings = status["metrics"]["preflight"]["warnings"]
+    assert any("failover is effectively disabled" in message for message in warnings)
+
+
+def test_supervisor_fails_with_dirty_worktree_by_default(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    (repo / "seed.txt").write_text("dirty\n", encoding="utf-8")
+    supervisor = _build_supervisor(repo, ArchitectConfig.default())
+
+    with pytest.raises(RuntimeError, match="dirty worktree"):
+        asyncio.run(supervisor.run("Build JWT auth"))
+
+
+def test_supervisor_can_isolate_dirty_worktree(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    (repo / "seed.txt").write_text("dirty\n", encoding="utf-8")
+
+    config = ArchitectConfig.default()
+    config.workflow.dirty_worktree_mode = "isolate"
+    config.project.lint_command = "python -c \"print('lint ok')\""
+    config.project.type_check_command = "python -c \"print('type ok')\""
+    config.project.test_command = "python -c \"print('test ok')\""
+    supervisor = _build_supervisor(repo, config)
+
+    summary = asyncio.run(supervisor.run("Build JWT auth"))
+    assert summary.completed_tasks >= 5
+    preflight = supervisor.status(verbose=True)["metrics"]["preflight"]
+    assert any("Dirty worktree isolation enabled" in item for item in preflight["warnings"])
+
+    unstaged = subprocess.run(
+        ["git", "diff", "--name-only"],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    assert "seed.txt" in unstaged
+
+
+def test_supervisor_rejects_unknown_task_tools(tmp_path: Path) -> None:
+    supervisor = _build_supervisor(tmp_path, ArchitectConfig.default())
+    task = WorkTask(
+        id="task-unknown-tools",
+        type="implement",
+        assigned_to="coder",
+        description="x",
+        allowed_tools=["read_file", "drop_database"],
+    )
+
+    with pytest.raises(RuntimeError, match="Tool policy rejected unknown tools"):
+        supervisor._allowed_tools_for_task(task)  # noqa: SLF001
+
+
+def test_run_command_prefers_exec_mode_for_simple_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _build_supervisor(tmp_path, ArchitectConfig.default())
+    observed: dict[str, Any] = {}
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        observed["payload"] = args[0]
+        observed["shell"] = kwargs.get("shell")
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = supervisor._run_command("python -c \"print('ok')\"")  # noqa: SLF001
+
+    assert result["exit_code"] == 0
+    assert result["used_shell"] is False
+    assert observed["shell"] is False
+    assert isinstance(observed["payload"], list)
+
+
+def test_run_command_uses_shell_for_shell_operators(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _build_supervisor(tmp_path, ArchitectConfig.default())
+    observed: dict[str, Any] = {}
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        observed["payload"] = args[0]
+        observed["shell"] = kwargs.get("shell")
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = supervisor._run_command("python -c \"print('ok')\" | cat")  # noqa: SLF001
+
+    assert result["exit_code"] == 0
+    assert result["used_shell"] is True
+    assert observed["shell"] is True
+    assert isinstance(observed["payload"], str)

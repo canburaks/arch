@@ -10,6 +10,7 @@ BackendName = Literal["codex", "claude", "codex_sdk", "auto"]
 StateBackendName = Literal["notes", "branch", "local"]
 BranchStrategy = Literal["single_branch_queue", "auxiliary_branches"]
 FallbackArtifactMode = Literal["local_only", "tracked"]
+DirtyWorktreeMode = Literal["fail", "isolate"]
 
 
 @dataclass(slots=True)
@@ -54,6 +55,13 @@ class WorkflowConfig:
     fallback_artifact_mode: FallbackArtifactMode = "local_only"
     tracked_fallback_dir: str = "docs/architect-runs"
     test_coverage_threshold: int = 0
+    dirty_worktree_mode: DirtyWorktreeMode = "fail"
+    review_docs_patterns: list[str] = field(
+        default_factory=lambda: ["docs/**", "**/README*", "**/*.md", "**/*.rst", "**/*.adoc"]
+    )
+    review_changelog_patterns: list[str] = field(
+        default_factory=lambda: ["**/CHANGELOG*", "**/changelog*"]
+    )
 
 
 @dataclass(slots=True)
@@ -132,6 +140,9 @@ class ArchitectConfig:
                 "fallback_artifact_mode": self.workflow.fallback_artifact_mode,
                 "tracked_fallback_dir": self.workflow.tracked_fallback_dir,
                 "test_coverage_threshold": self.workflow.test_coverage_threshold,
+                "dirty_worktree_mode": self.workflow.dirty_worktree_mode,
+                "review_docs_patterns": list(self.workflow.review_docs_patterns),
+                "review_changelog_patterns": list(self.workflow.review_changelog_patterns),
             },
             "guardrails": {
                 "max_file_changes_per_patch": self.guardrails.max_file_changes_per_patch,
