@@ -73,8 +73,19 @@ class ResilientBackend(AgentBackend):
             attempts.append((self.fallback_name, self.fallback_backend))
 
         errors: list[str] = []
+        failover_cause = ""
         for backend_name, backend in attempts:
             for attempt in range(self.retry_policy.max_retries + 1):
+                if backend_name != self.primary_name and attempt == 0:
+                    self._emit(
+                        {
+                            "event": "backend_failover_start",
+                            "from_backend": self.primary_name,
+                            "to_backend": backend_name,
+                            "call": call_name,
+                            "cause": failover_cause or "primary_failed",
+                        }
+                    )
                 is_retry = attempt > 0
                 if is_retry:
                     delay = self.retry_policy.backoff_seconds * (2 ** (attempt - 1))
@@ -95,6 +106,9 @@ class ResilientBackend(AgentBackend):
                             {
                                 "event": "backend_fallback_success",
                                 "backend": backend_name,
+                                "from_backend": self.primary_name,
+                                "to_backend": backend_name,
+                                "cause": failover_cause or "primary_failed",
                                 "attempt": attempt,
                                 "call": call_name,
                             }
@@ -102,6 +116,8 @@ class ResilientBackend(AgentBackend):
                     return chunks
                 except BackendExecutionError as exc:
                     errors.append(f"{backend_name}[{attempt}]: {exc}")
+                    if backend_name == self.primary_name:
+                        failover_cause = str(exc)
                     self._emit(
                         {
                             "event": "backend_attempt_failed",
@@ -116,6 +132,8 @@ class ResilientBackend(AgentBackend):
                         break
                 except Exception as exc:
                     errors.append(f"{backend_name}[{attempt}]: {exc}")
+                    if backend_name == self.primary_name:
+                        failover_cause = str(exc)
                     self._emit(
                         {
                             "event": "backend_attempt_failed",
@@ -164,8 +182,19 @@ class ResilientBackend(AgentBackend):
             attempts.append((self.fallback_name, self.fallback_backend))
 
         errors: list[str] = []
+        failover_cause = ""
         for backend_name, backend in attempts:
             for attempt in range(self.retry_policy.max_retries + 1):
+                if backend_name != self.primary_name and attempt == 0:
+                    self._emit(
+                        {
+                            "event": "backend_failover_start",
+                            "from_backend": self.primary_name,
+                            "to_backend": backend_name,
+                            "call": "execute_with_tools",
+                            "cause": failover_cause or "primary_failed",
+                        }
+                    )
                 is_retry = attempt > 0
                 if is_retry:
                     delay = self.retry_policy.backoff_seconds * (2 ** (attempt - 1))
@@ -193,6 +222,9 @@ class ResilientBackend(AgentBackend):
                             {
                                 "event": "backend_fallback_success",
                                 "backend": backend_name,
+                                "from_backend": self.primary_name,
+                                "to_backend": backend_name,
+                                "cause": failover_cause or "primary_failed",
                                 "attempt": attempt,
                                 "call": "execute_with_tools",
                             }
@@ -210,6 +242,8 @@ class ResilientBackend(AgentBackend):
                         retriable=True,
                     )
                     errors.append(f"{backend_name}[{attempt}]: {error}")
+                    if backend_name == self.primary_name:
+                        failover_cause = str(error)
                     self._emit(
                         {
                             "event": "backend_attempt_failed",
@@ -223,6 +257,8 @@ class ResilientBackend(AgentBackend):
                     _ = exc
                 except BackendExecutionError as exc:
                     errors.append(f"{backend_name}[{attempt}]: {exc}")
+                    if backend_name == self.primary_name:
+                        failover_cause = str(exc)
                     self._emit(
                         {
                             "event": "backend_attempt_failed",
@@ -237,6 +273,8 @@ class ResilientBackend(AgentBackend):
                         break
                 except Exception as exc:
                     errors.append(f"{backend_name}[{attempt}]: {exc}")
+                    if backend_name == self.primary_name:
+                        failover_cause = str(exc)
                     self._emit(
                         {
                             "event": "backend_attempt_failed",

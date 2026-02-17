@@ -6,6 +6,14 @@ from typing import Any
 
 from architect.backends.base import AgentBackend
 
+TOOL_POLICY_ALLOWLIST = {
+    "read_file",
+    "write_file",
+    "edit_file",
+    "run_command",
+    "search",
+}
+
 
 @dataclass(slots=True)
 class SpecialistResponse:
@@ -33,6 +41,19 @@ class SpecialistAgent:
         except (FileNotFoundError, ModuleNotFoundError):
             return self.fallback_prompt.strip()
 
+    @staticmethod
+    def _normalize_allowed_tools(allowed_tools: list[str] | None) -> list[str] | None:
+        if not allowed_tools:
+            return None
+        normalized = sorted({str(tool).strip() for tool in allowed_tools if str(tool).strip()})
+        unknown = [tool for tool in normalized if tool not in TOOL_POLICY_ALLOWLIST]
+        if unknown:
+            raise RuntimeError(
+                "Tool policy rejected unknown tools for specialist run: "
+                + ", ".join(unknown)
+            )
+        return normalized
+
     async def run(
         self,
         instruction: str,
@@ -42,22 +63,25 @@ class SpecialistAgent:
         run_context = dict(context)
         if self.model:
             run_context["model"] = self.model
+        normalized_tools = self._normalize_allowed_tools(allowed_tools)
 
-        if allowed_tools:
-            payload = await self.backend.execute_with_tools(
+        if normalized_tools:
+            chunks: list[str] = []
+            async for chunk in self.backend.execute(
                 system_prompt=self.system_prompt,
                 user_prompt=instruction,
-                allowed_tools=allowed_tools,
-            )
-            content = str(payload.get("content", "")).strip()
+                context=run_context,
+                tools=normalized_tools,
+            ):
+                chunks.append(chunk)
             return SpecialistResponse(
                 role=self.role,
-                content=content,
+                content="".join(chunks).strip(),
                 metadata={
                     "instruction": instruction,
                     "tool_mode": True,
-                    "allowed_tools": list(allowed_tools),
-                    "payload": payload,
+                    "allowed_tools": list(normalized_tools),
+                    "tool_policy_enforced": True,
                 },
             )
 

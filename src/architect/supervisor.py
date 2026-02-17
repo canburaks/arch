@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import importlib.util
+import json
 import re
+import shlex
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -18,6 +21,14 @@ from architect.state.patches import Patch, PatchStackManager
 
 SEVERITY_PATTERN = re.compile(r"\b(BLOCKER|MAJOR|MINOR|SUGGESTION)\b", re.IGNORECASE)
 COVERAGE_PATTERN = re.compile(r"\b(\d{1,3})%\b")
+SHELL_REQUIRED_PATTERN = re.compile(r"(?:\|\||&&|[|;<>`]|[$]\()")
+TOOL_POLICY_ALLOWLIST = {
+    "read_file",
+    "write_file",
+    "edit_file",
+    "run_command",
+    "search",
+}
 
 
 def _utcnow_iso() -> str:
@@ -69,6 +80,7 @@ class Supervisor:
         self.config = config
         self.repo_root = repo_root.resolve()
         self.supervisor_agent = supervisor_agent
+        self._isolated_dirty_paths: list[str] = []
 
     @staticmethod
     def _gate_name(task_type: str) -> str:
@@ -99,6 +111,41 @@ class Supervisor:
     @staticmethod
     def _parse_review_findings(content: str) -> dict[str, int]:
         findings = {"BLOCKER": 0, "MAJOR": 0, "MINOR": 0, "SUGGESTION": 0}
+        parsed_structured = False
+        for payload in Supervisor._extract_json_objects(content):
+            if not isinstance(payload, dict):
+                continue
+            counts = payload.get("counts")
+            if isinstance(counts, dict):
+                for key, value in counts.items():
+                    normalized = str(key).upper()
+                    if normalized in findings:
+                        try:
+                            findings[normalized] += int(value)
+                            parsed_structured = True
+                        except (TypeError, ValueError):
+                            continue
+            severity = payload.get("severity")
+            if isinstance(severity, str):
+                normalized = severity.upper()
+                if normalized in findings:
+                    findings[normalized] += 1
+                    parsed_structured = True
+            items = payload.get("findings")
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    severity = item.get("severity")
+                    if isinstance(severity, str):
+                        normalized = severity.upper()
+                        if normalized in findings:
+                            findings[normalized] += 1
+                            parsed_structured = True
+
+        if parsed_structured:
+            return findings
+
         for match in SEVERITY_PATTERN.finditer(content):
             findings[match.group(1).upper()] += 1
         return findings
@@ -108,11 +155,52 @@ class Supervisor:
         stdout_tail = str(result.get("stdout_tail", ""))
         stderr_tail = str(result.get("stderr_tail", ""))
         output = f"{stdout_tail}\n{stderr_tail}"
+        for payload in Supervisor._extract_json_objects(output):
+            percent = Supervisor._coverage_from_payload(payload)
+            if percent is not None:
+                return percent
         matches = COVERAGE_PATTERN.findall(output)
         if not matches:
             return None
         percent = max(int(item) for item in matches)
         return min(100, max(0, percent))
+
+    @staticmethod
+    def _extract_json_objects(raw_text: str) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        for raw_line in raw_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if not (line.startswith("{") and line.endswith("}")):
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                payloads.append(parsed)
+        return payloads
+
+    @staticmethod
+    def _coverage_from_payload(payload: dict[str, Any]) -> int | None:
+        if "coverage_percent" in payload:
+            try:
+                percent = int(float(payload["coverage_percent"]))
+                return min(100, max(0, percent))
+            except (TypeError, ValueError):
+                return None
+
+        coverage = payload.get("coverage")
+        if isinstance(coverage, (int, float)):
+            percent = int(float(coverage))
+            return min(100, max(0, percent))
+        if isinstance(coverage, dict):
+            raw_percent = coverage.get("percent")
+            if isinstance(raw_percent, (int, float)):
+                percent = int(float(raw_percent))
+                return min(100, max(0, percent))
+        return None
 
     @staticmethod
     def _matches_forbidden_path(path: str, patterns: list[str]) -> str | None:
@@ -133,27 +221,304 @@ class Supervisor:
             raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
         return proc
 
-    def _ensure_clean_worktree(self) -> None:
+    @staticmethod
+    def _status_line_path(status_line: str) -> str:
+        candidate = status_line[3:].strip()
+        if " -> " in candidate:
+            candidate = candidate.split(" -> ", maxsplit=1)[1].strip()
+        return candidate
+
+    def _dirty_worktree_paths(self) -> list[str]:
         if not self.patches.git_enabled:
-            return
+            return []
         proc = self._run_git(["status", "--porcelain"], check=True)
         lines = [line for line in proc.stdout.splitlines() if line.strip()]
         if not lines:
-            return
-        # Ignore state artifacts used for local cache/audit trails.
-        non_state = []
+            return []
+        dirty_paths: list[str] = []
         for line in lines:
             if ".architect/" in line:
                 continue
             if line.endswith(" architect.toml") or line.endswith("\tarchitect.toml"):
                 continue
-            non_state.append(line)
-        if non_state:
-            details = "\n".join(non_state[:20])
+            path = self._status_line_path(line)
+            if not path:
+                continue
+            dirty_paths.append(path)
+        return dirty_paths
+
+    def _ensure_clean_worktree(self) -> list[str]:
+        dirty_paths = self._dirty_worktree_paths()
+        if not dirty_paths:
+            self._isolated_dirty_paths = []
+            return []
+
+        if self.config.workflow.dirty_worktree_mode == "isolate":
+            self._isolated_dirty_paths = sorted(set(dirty_paths))
+            return self._isolated_dirty_paths
+
+        details = "\n".join(dirty_paths[:20])
+        raise RuntimeError(
+            "Refusing to run with dirty worktree. Commit/stash changes first.\n"
+            f"Detected:\n{details}"
+        )
+
+    def _record_dirty_isolation(self, dirty_paths: list[str]) -> None:
+        if not dirty_paths:
+            return
+        metrics = self.state.get_metrics()
+        history = metrics.get("dirty_worktree_isolation", [])
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "at": _utcnow_iso(),
+                "count": len(dirty_paths),
+                "paths": dirty_paths[:100],
+            }
+        )
+        metrics["dirty_worktree_isolation"] = history[-20:]
+        self.state.set_metrics(metrics)
+
+    @staticmethod
+    def _normalize_tools(allowed_tools: list[str] | None) -> list[str] | None:
+        if not allowed_tools:
+            return None
+        normalized = sorted({str(tool).strip() for tool in allowed_tools if str(tool).strip()})
+        unknown = [tool for tool in normalized if tool not in TOOL_POLICY_ALLOWLIST]
+        if unknown:
             raise RuntimeError(
-                "Refusing to run with dirty worktree. Commit/stash changes first.\n"
-                f"Detected:\n{details}"
+                "Tool policy rejected unknown tools: "
+                + ", ".join(unknown)
             )
+        return normalized
+
+    def _command_available(self, executable: str) -> bool:
+        if not executable.strip():
+            return False
+        check = subprocess.run(
+            ["sh", "-lc", f"command -v {shlex.quote(executable)} >/dev/null 2>&1"],
+            cwd=self.repo_root,
+            text=True,
+            capture_output=True,
+        )
+        return check.returncode == 0
+
+    @staticmethod
+    def _backend_probe_result(backend_name: str, *, command_available: bool) -> tuple[bool, str]:
+        if backend_name == "codex":
+            return command_available, "codex CLI binary not found in PATH."
+        if backend_name == "claude":
+            return command_available, "claude CLI binary not found in PATH."
+        if backend_name in {"codex_sdk", "auto"}:
+            sdk_available = importlib.util.find_spec("openai") is not None
+            available = sdk_available or command_available
+            return (
+                available,
+                "openai package missing and codex CLI binary not found in PATH.",
+            )
+        return False, f"Unsupported backend configured: {backend_name}"
+
+    def _preflight_backend_checks(self) -> list[dict[str, Any]]:
+        checks: list[dict[str, Any]] = []
+        if self.config.backend.primary == self.config.backend.fallback:
+            checks.append(
+                {
+                    "type": "backend",
+                    "slot": "configuration",
+                    "backend": self.config.backend.primary,
+                    "ok": True,
+                    "severity": "warning",
+                    "message": (
+                        "Primary and fallback backends are identical; failover is effectively "
+                        "disabled."
+                    ),
+                }
+            )
+
+        runtime_backends = [
+            getattr(agent, "backend", None)
+            for agent in [*self.specialists.values(), self.supervisor_agent]
+            if agent is not None
+        ]
+        requires_backend_probe = any(
+            hasattr(backend, "primary_name") and hasattr(backend, "fallback_name")
+            for backend in runtime_backends
+            if backend is not None
+        )
+        if not requires_backend_probe:
+            checks.append(
+                {
+                    "type": "backend",
+                    "slot": "runtime",
+                    "backend": "custom",
+                    "ok": True,
+                    "severity": "info",
+                    "message": "Backend preflight probe skipped for custom runtime backend.",
+                }
+            )
+            return checks
+
+        slots = [
+            ("primary", self.config.backend.primary),
+            ("fallback", self.config.backend.fallback),
+        ]
+        slot_results: list[dict[str, Any]] = []
+        for slot, backend_name in slots:
+            if backend_name in {"codex", "codex_sdk", "auto"}:
+                command_token = "codex"
+            else:
+                command_token = backend_name
+            command_available = self._command_available(command_token)
+            available, unavailable_reason = self._backend_probe_result(
+                backend_name,
+                command_available=command_available,
+            )
+            slot_results.append(
+                {
+                    "type": "backend",
+                    "slot": slot,
+                    "backend": backend_name,
+                    "ok": available,
+                    "reason": "" if available else unavailable_reason,
+                }
+            )
+
+        any_available = any(bool(item.get("ok")) for item in slot_results)
+        for item in slot_results:
+            if item["ok"]:
+                item["severity"] = "info"
+                item["message"] = (
+                    f"{item['slot']} backend '{item['backend']}' is available."
+                )
+            elif any_available:
+                item["severity"] = "warning"
+                item["message"] = (
+                    f"{item['slot']} backend '{item['backend']}' is unavailable: {item['reason']}"
+                )
+            else:
+                item["severity"] = "error"
+                item["message"] = (
+                    f"{item['slot']} backend '{item['backend']}' is unavailable: {item['reason']}"
+                )
+        checks.extend(slot_results)
+        return checks
+
+    def _preflight_command_checks(self) -> list[dict[str, Any]]:
+        checks: list[dict[str, Any]] = []
+        command_specs: list[tuple[str, str]] = []
+        if self.config.workflow.auto_lint:
+            command_specs.append(("lint", self.config.project.lint_command))
+        type_command = self.config.project.type_check_command.strip()
+        if type_command:
+            command_specs.append(("type_check", type_command))
+        if self.config.workflow.auto_test:
+            command_specs.append(("test", self.config.project.test_command))
+
+        for check_name, command in command_specs:
+            try:
+                tokens = shlex.split(command)
+            except ValueError as exc:
+                checks.append(
+                    {
+                        "type": "command",
+                        "name": check_name,
+                        "command": command,
+                        "ok": False,
+                        "severity": "error",
+                        "message": f"{check_name} command could not be parsed: {exc}",
+                    }
+                )
+                continue
+
+            if not tokens:
+                checks.append(
+                    {
+                        "type": "command",
+                        "name": check_name,
+                        "command": command,
+                        "ok": False,
+                        "severity": "error",
+                        "message": f"{check_name} command is empty.",
+                    }
+                )
+                continue
+
+            executable = tokens[0]
+            available = self._command_available(executable)
+            checks.append(
+                {
+                    "type": "command",
+                    "name": check_name,
+                    "command": command,
+                    "ok": available,
+                    "severity": "info" if available else "error",
+                    "message": (
+                        f"{check_name} command executable '{executable}' is available."
+                        if available
+                        else (
+                            f"{check_name} command executable '{executable}' "
+                            "not found in PATH."
+                        )
+                    ),
+                }
+            )
+        return checks
+
+    def _record_preflight(self, payload: dict[str, Any]) -> None:
+        metrics = self.state.get_metrics()
+        history = metrics.get("preflight_history", [])
+        if not isinstance(history, list):
+            history = []
+        history.append(payload)
+        metrics["preflight"] = payload
+        metrics["preflight_history"] = history[-30:]
+        self.state.set_metrics(metrics)
+
+        context = self.state.get_context()
+        context["preflight"] = {
+            "checked_at": payload.get("checked_at"),
+            "ok": payload.get("ok", False),
+            "errors": payload.get("errors", []),
+            "warnings": payload.get("warnings", []),
+        }
+        self.state.set_context(context)
+
+    def _run_preflight(self, *, resume: bool) -> dict[str, Any]:
+        checks: list[dict[str, Any]] = []
+        checks.extend(self._preflight_backend_checks())
+        checks.extend(self._preflight_command_checks())
+        if self._isolated_dirty_paths:
+            checks.append(
+                {
+                    "type": "worktree",
+                    "name": "dirty_isolation",
+                    "ok": True,
+                    "severity": "warning",
+                    "message": (
+                        "Dirty worktree isolation enabled; pre-existing changed files will be "
+                        "excluded from patch staging."
+                    ),
+                    "paths": list(self._isolated_dirty_paths)[:100],
+                }
+            )
+
+        errors = [item["message"] for item in checks if item.get("severity") == "error"]
+        warnings = [item["message"] for item in checks if item.get("severity") == "warning"]
+        payload = {
+            "checked_at": _utcnow_iso(),
+            "ok": not errors,
+            "resume": resume,
+            "errors": errors,
+            "warnings": warnings,
+            "checks": checks,
+        }
+        self._record_preflight(payload)
+        if errors:
+            raise RuntimeError(
+                "Runtime preflight failed:\n" + "\n".join(f"- {item}" for item in errors)
+            )
+        return payload
 
     def _persist_tasks(self, tasks: list[WorkTask]) -> None:
         self.state.set_tasks([asdict(task) for task in tasks])
@@ -324,10 +689,30 @@ class Supervisor:
         self.state.set_metrics(metrics)
 
     def _run_command(self, command: str) -> dict[str, Any]:
+        command_text = command.strip()
+        if not command_text:
+            return {
+                "type": "command",
+                "command": command,
+                "exit_code": 1,
+                "stdout_tail": "",
+                "stderr_tail": "Command is empty.",
+                "used_shell": False,
+            }
+
+        used_shell = bool(SHELL_REQUIRED_PATTERN.search(command_text))
+        command_payload: str | list[str] = command_text
+        if not used_shell:
+            try:
+                command_payload = shlex.split(command_text)
+            except ValueError:
+                used_shell = True
+                command_payload = command_text
+
         proc = subprocess.run(
-            command,
+            command_payload,
             cwd=self.repo_root,
-            shell=True,
+            shell=used_shell,
             text=True,
             capture_output=True,
         )
@@ -337,6 +722,7 @@ class Supervisor:
             "exit_code": proc.returncode,
             "stdout_tail": proc.stdout.strip()[-1000:],
             "stderr_tail": proc.stderr.strip()[-1000:],
+            "used_shell": used_shell,
         }
 
     def _assert_guardrail_test_coverage(self, run_patch_files: list[str]) -> tuple[bool, str]:
@@ -350,13 +736,79 @@ class Supervisor:
                     break
         if not guarded_changes:
             return True, ""
-        test_touched = any(path.replace("\\", "/").startswith("tests/") for path in run_patch_files)
+        test_touched = any(self._is_test_path(path) for path in run_patch_files)
         if test_touched:
             return True, ""
         return False, (
             "Guardrail require_tests_for failed: source files changed without matching tests. "
             f"Patterns={guarded_patterns}"
         )
+
+    def _is_guarded_source_path(self, path: str) -> bool:
+        normalized = path.replace("\\", "/")
+        patterns = list(self.config.guardrails.require_tests_for)
+        if patterns:
+            return any(fnmatch.fnmatch(normalized, pattern) for pattern in patterns)
+        return (
+            not self._is_internal_runtime_path(path)
+            and not self._is_test_path(path)
+            and not self._is_documentation_evidence_path(path)
+        )
+
+    @staticmethod
+    def _is_test_path(path: str) -> bool:
+        normalized = path.replace("\\", "/").lower()
+        name = normalized.rsplit("/", maxsplit=1)[-1]
+        segments = set(normalized.split("/"))
+        if {"tests", "test", "__tests__", "spec", "specs"} & segments:
+            return True
+        if name.startswith("test_") or name.endswith("_test.py"):
+            return True
+        return any(
+            name.endswith(suffix)
+            for suffix in (
+                ".test.js",
+                ".test.jsx",
+                ".test.ts",
+                ".test.tsx",
+                ".spec.js",
+                ".spec.jsx",
+                ".spec.ts",
+                ".spec.tsx",
+            )
+        )
+
+    @staticmethod
+    def _is_documentation_path(path: str) -> bool:
+        normalized = path.replace("\\", "/").lower()
+        name = normalized.rsplit("/", maxsplit=1)[-1]
+        if name.startswith("readme") or "changelog" in name:
+            return True
+        if any(token in normalized.split("/") for token in ("docs", "doc", "documentation")):
+            return True
+        return name.endswith((".md", ".rst", ".adoc"))
+
+    def _matches_any_pattern(self, path: str, patterns: list[str]) -> bool:
+        normalized = path.replace("\\", "/")
+        for pattern in patterns:
+            if fnmatch.fnmatch(normalized, pattern):
+                return True
+        return False
+
+    def _is_documentation_evidence_path(self, path: str) -> bool:
+        if self._matches_any_pattern(path, list(self.config.workflow.review_docs_patterns)):
+            return True
+        return self._is_documentation_path(path)
+
+    def _is_changelog_evidence_path(self, path: str) -> bool:
+        if self._matches_any_pattern(path, list(self.config.workflow.review_changelog_patterns)):
+            return True
+        return "changelog" in path.lower()
+
+    @staticmethod
+    def _is_internal_runtime_path(path: str) -> bool:
+        normalized = path.replace("\\", "/").lower()
+        return normalized.startswith(".architect/")
 
     def _plan_quality_signals(self, content: str) -> dict[str, Any]:
         lower = content.lower()
@@ -509,14 +961,13 @@ class Supervisor:
                 if not coverage_ok:
                     passed = False
                     reason = coverage_reason
-            source_files = [p for p in run_patch_files if p.replace("\\", "/").startswith("src/")]
-            doc_files = [
+            source_files = [
                 p
                 for p in run_patch_files
-                if p.replace("\\", "/").startswith("docs/")
-                or p.replace("\\", "/").lower().endswith("readme.md")
+                if self._is_guarded_source_path(p)
             ]
-            changelog_files = [p for p in run_patch_files if "changelog" in p.lower()]
+            doc_files = [p for p in run_patch_files if self._is_documentation_evidence_path(p)]
+            changelog_files = [p for p in run_patch_files if self._is_changelog_evidence_path(p)]
             artifacts.append(
                 {
                     "type": "review_file_evidence",
@@ -550,7 +1001,7 @@ class Supervisor:
                 reason = "Documentation output is empty."
             if passed:
                 source_touched = any(
-                    path.replace("\\", "/").startswith("src/")
+                    self._is_guarded_source_path(path)
                     for path in run_patch_files
                 )
                 if source_touched:
@@ -590,18 +1041,19 @@ class Supervisor:
                 ready.append(task)
         return ready
 
-    @staticmethod
-    def _allowed_tools_for_task(task: WorkTask) -> list[str] | None:
+    def _allowed_tools_for_task(self, task: WorkTask) -> list[str] | None:
         if task.allowed_tools:
-            return list(task.allowed_tools)
+            return self._normalize_tools(task.allowed_tools)
         if task.type == "implement":
-            return ["read_file", "write_file", "edit_file", "run_command", "search"]
+            return self._normalize_tools(
+                ["read_file", "write_file", "edit_file", "run_command", "search"]
+            )
         if task.type == "test":
-            return ["read_file", "run_command"]
+            return self._normalize_tools(["read_file", "run_command"])
         if task.type == "review":
-            return ["read_file", "run_command", "search"]
+            return self._normalize_tools(["read_file", "run_command", "search"])
         if task.type == "document":
-            return ["read_file", "write_file", "edit_file", "search"]
+            return self._normalize_tools(["read_file", "write_file", "edit_file", "search"])
         return None
 
     async def _run_specialist(
@@ -865,6 +1317,7 @@ class Supervisor:
             fallback_mode=self.config.workflow.fallback_artifact_mode,
             max_files=self.config.guardrails.max_file_changes_per_patch,
             forbidden_paths=list(self.config.guardrails.forbidden_paths),
+            exclude_paths=list(self._isolated_dirty_paths),
         )
         return patch
 
@@ -1007,8 +1460,14 @@ class Supervisor:
         if context.get("paused") and not resume:
             raise RuntimeError("Workflow is paused. Run `arch resume` first.")
 
+        dirty_paths: list[str] = []
         if not resume:
-            self._ensure_clean_worktree()
+            dirty_paths = self._ensure_clean_worktree()
+            self._record_dirty_isolation(dirty_paths)
+        else:
+            self._isolated_dirty_paths = []
+
+        preflight = self._run_preflight(resume=resume)
 
         pending_modify_tasks = self._load_pending_modify_tasks()
         existing_tasks_payload = self.state.get_tasks()
@@ -1077,6 +1536,16 @@ class Supervisor:
             "started_at": started_at,
             "paused": False,
             "current_run_id": run_id,
+            "preflight": {
+                "checked_at": preflight["checked_at"],
+                "ok": preflight["ok"],
+                "errors": preflight["errors"],
+                "warnings": preflight["warnings"],
+            },
+            "dirty_worktree": {
+                "mode": self.config.workflow.dirty_worktree_mode,
+                "isolated_paths": list(dirty_paths),
+            },
             "session": {
                 "run_id": run_id,
                 "goal": goal,
@@ -1142,7 +1611,7 @@ class Supervisor:
 
                         response = await self._run_specialist(ready_task, goal)
                         ready_task.output_summary = response.content[:4000]
-                        self._write_task_artifact(run_id, ready_task, response)
+                        artifact_path = self._write_task_artifact(run_id, ready_task, response)
 
                         if ready_task.type == "plan" and len(tasks) == 1:
                             plan_steps = self._extract_plan_steps(response.content)
@@ -1154,28 +1623,37 @@ class Supervisor:
                             self._persist_tasks(tasks)
                             ready_task = tasks[0]
 
-                        if (
-                            ready_task.type in {"implement", "document"}
-                            and self.patches.git_enabled
-                        ):
-                            created_patch = self.patches.create_task_patch_from_worktree(
-                                subject=f"architect: {ready_task.id}",
-                                body=(
-                                    f"Run: {run_id}\nTask: {ready_task.id}\n\n"
-                                    f"{response.content[:2000]}"
-                                ),
-                                task_id=ready_task.id,
-                                run_id=run_id,
-                                fallback_file=self._tracked_fallback_patch_path(run_id, ready_task),
-                                fallback_content=self._tracked_fallback_patch_content(
-                                    run_id,
-                                    ready_task,
-                                    response.content,
-                                ),
-                                fallback_mode=self.config.workflow.fallback_artifact_mode,
-                                max_files=self.config.guardrails.max_file_changes_per_patch,
-                                forbidden_paths=list(self.config.guardrails.forbidden_paths),
-                            )
+                        if ready_task.type in {"implement", "document"}:
+                            if self.patches.git_enabled:
+                                created_patch = self.patches.create_task_patch_from_worktree(
+                                    subject=f"architect: {ready_task.id}",
+                                    body=(
+                                        f"Run: {run_id}\nTask: {ready_task.id}\n\n"
+                                        f"{response.content[:2000]}"
+                                    ),
+                                    task_id=ready_task.id,
+                                    run_id=run_id,
+                                    fallback_file=self._tracked_fallback_patch_path(
+                                        run_id, ready_task
+                                    ),
+                                    fallback_content=self._tracked_fallback_patch_content(
+                                        run_id,
+                                        ready_task,
+                                        response.content,
+                                    ),
+                                    fallback_mode=self.config.workflow.fallback_artifact_mode,
+                                    max_files=self.config.guardrails.max_file_changes_per_patch,
+                                    forbidden_paths=list(self.config.guardrails.forbidden_paths),
+                                    exclude_paths=list(self._isolated_dirty_paths),
+                                )
+                            else:
+                                local_path = artifact_path.relative_to(self.repo_root)
+                                created_patch = self.patches.record_local_patch(
+                                    subject=f"architect: {ready_task.id}",
+                                    task_id=ready_task.id,
+                                    run_id=run_id,
+                                    files_changed=[str(local_path).replace("\\", "/")],
+                                )
                             ready_task.patch_id = created_patch.patch_id
                             run_patch_files.extend(created_patch.files_changed)
                             self._append_session_patch(created_patch)

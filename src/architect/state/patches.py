@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from architect.state.git_notes import ArchitectStateError, GitNotesStore
 
@@ -158,7 +159,37 @@ class PatchStackManager:
         commit_hashes: set[str] | None = None,
     ) -> list[Patch]:
         if not self.git_enabled:
-            return []
+            metrics = self._metrics()
+            stack = metrics.get("patch_stack", [])
+            if not isinstance(stack, list):
+                return []
+            patches: list[Patch] = []
+            for item in stack:
+                if not isinstance(item, dict):
+                    continue
+                commit_hash = item.get("commit_hash")
+                patch_id = item.get("patch_id")
+                if not isinstance(commit_hash, str) or not isinstance(patch_id, str):
+                    continue
+                if commit_hashes is not None and commit_hash not in commit_hashes:
+                    continue
+                subject = str(item.get("subject", ""))
+                status = str(item.get("status", "pending"))
+                task_id = item.get("task_id")
+                files_changed = item.get("files_changed", [])
+                if not isinstance(files_changed, list):
+                    files_changed = []
+                patches.append(
+                    Patch(
+                        patch_id=patch_id,
+                        commit_hash=commit_hash,
+                        subject=subject,
+                        status=status,
+                        task_id=task_id if isinstance(task_id, str) else None,
+                        files_changed=[str(path) for path in files_changed],
+                    )
+                )
+            return patches
         range_part = f"{base_ref}..HEAD" if base_ref else "HEAD"
         proc = self._run_git(
             ["log", "--reverse", "--pretty=format:%H%x09%s", range_part],
@@ -247,6 +278,19 @@ class PatchStackManager:
 
     def changed_files_for_commit(self, commit_hash: str) -> list[str]:
         if not self.git_enabled:
+            metrics = self._metrics()
+            stack = metrics.get("patch_stack", [])
+            if not isinstance(stack, list):
+                return []
+            for item in stack:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("commit_hash") != commit_hash:
+                    continue
+                files_changed = item.get("files_changed", [])
+                if not isinstance(files_changed, list):
+                    return []
+                return [str(path) for path in files_changed]
             return []
         proc = self._run_git(["show", "--pretty=format:", "--name-only", commit_hash], check=False)
         if proc.returncode != 0:
@@ -258,7 +302,16 @@ class PatchStackManager:
         if patch is None:
             raise ArchitectStateError(f"Patch not found: {patch_ref}")
         if not self.git_enabled:
-            return ""
+            files = "\n".join(f"- {path}" for path in patch.files_changed)
+            return "\n".join(
+                [
+                    f"Patch: {patch.patch_id}",
+                    f"Subject: {patch.subject}",
+                    f"Status: {patch.status}",
+                    "Files:",
+                    files or "- (none)",
+                ]
+            )
         proc = self._run_git(
             ["show", "--stat", "--pretty=format:%H%n%s%n%b", patch.commit_hash],
             check=True,
@@ -413,10 +466,21 @@ class PatchStackManager:
         fallback_mode: str = "tracked",
         max_files: int | None = None,
         forbidden_paths: list[str] | None = None,
+        exclude_paths: list[str] | None = None,
     ) -> Patch:
         if not self.git_enabled:
             raise ArchitectStateError("Creating a patch requires a git repository.")
-        self._run_git(["add", "-A", "--", ".", ":(exclude).architect/**"], check=True)
+        add_args = ["add", "-A", "--", ".", ":(exclude).architect/**"]
+        for path in exclude_paths or []:
+            normalized = path.replace("\\", "/").strip()
+            if not normalized:
+                continue
+            if normalized.startswith("./"):
+                normalized = normalized[2:]
+            if normalized.startswith(".architect/"):
+                continue
+            add_args.append(f":(exclude){normalized}")
+        self._run_git(add_args, check=True)
         staged = self._staged_files()
         if not staged:
             if fallback_mode == "tracked":
@@ -454,6 +518,59 @@ class PatchStackManager:
         commit_hash = self._run_git(["rev-parse", "HEAD"], check=True).stdout.strip()
         return self.record_patch(commit_hash, subject, task_id, status="pending", run_id=run_id)
 
+    def record_local_patch(
+        self,
+        *,
+        subject: str,
+        task_id: str,
+        run_id: str,
+        files_changed: list[str] | None = None,
+    ) -> Patch:
+        patch_id = f"patch-local-{uuid4().hex[:8]}"
+        commit_hash = patch_id
+        patch = Patch(
+            patch_id=patch_id,
+            commit_hash=commit_hash,
+            subject=subject,
+            status="pending",
+            task_id=task_id,
+            files_changed=list(files_changed or []),
+        )
+        if self.state_store is None:
+            return patch
+
+        metrics = self.state_store.get_metrics()
+        patch_index = metrics.get("patch_index", {})
+        lifecycle = metrics.get("patch_lifecycle", {})
+        stack = metrics.get("patch_stack", [])
+        if not isinstance(patch_index, dict):
+            patch_index = {}
+        if not isinstance(lifecycle, dict):
+            lifecycle = {}
+        if not isinstance(stack, list):
+            stack = []
+
+        patch_index[commit_hash] = patch.patch_id
+        lifecycle[commit_hash] = "pending"
+        stack.append(
+            {
+                "patch_id": patch.patch_id,
+                "commit_hash": patch.commit_hash,
+                "subject": patch.subject,
+                "status": patch.status,
+                "task_id": patch.task_id,
+                "run_id": run_id,
+                "created_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+                "files_changed": patch.files_changed,
+                "local": True,
+            }
+        )
+        metrics["patch_index"] = patch_index
+        metrics["patch_lifecycle"] = lifecycle
+        metrics["patch_stack"] = stack
+        self.state_store.set_metrics(metrics)
+        return patch
+
     def reject_patch(
         self,
         patch_ref: str,
@@ -463,6 +580,19 @@ class PatchStackManager:
         patch = self.resolve_patch(patch_ref, base_ref=base_ref, commit_hashes=commit_hashes)
         if patch is None:
             raise ArchitectStateError(f"Patch not found: {patch_ref}")
+
+        if not self.git_enabled:
+            self.update_patch_status(
+                patch.commit_hash,
+                "rejected",
+                note="Rejected in local-mode lifecycle.",
+            )
+            refreshed = self.resolve_patch(
+                patch.patch_id,
+                base_ref=base_ref,
+                commit_hashes=commit_hashes,
+            )
+            return refreshed or patch
 
         revert_proc = self._run_git(
             ["revert", "--no-edit", patch.commit_hash],
@@ -535,7 +665,10 @@ class PatchStackManager:
 
     def rollback(self, checkpoint_id: str) -> str:
         if not self.git_enabled:
-            raise ArchitectStateError("Rollback requires a git repository.")
+            checkpoints = set(self.list_checkpoints())
+            if checkpoint_id not in checkpoints:
+                raise ArchitectStateError(f"Checkpoint not found: {checkpoint_id}")
+            return f"local/{checkpoint_id}"
         safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", checkpoint_id)
         rollback_branch = (
             f"architect/rollback-{safe_name}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"

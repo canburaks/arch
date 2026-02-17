@@ -31,20 +31,34 @@ class CodexBackend(AgentBackend):
         context: dict[str, Any],
         tools: list[str] | None = None,
     ) -> list[str]:
+        rendered_prompt = self._build_user_prompt(user_prompt, context, tools)
+        requested_model = context.get("model")
         command = [
             self.binary,
             "exec",
-            "--output-format",
-            "jsonl",
+            "--json",
             "-c",
-            f"system_prompt={json.dumps(system_prompt, ensure_ascii=False)}",
+            f"instructions={json.dumps(system_prompt, ensure_ascii=False)}",
         ]
-        if context:
-            command.extend(["-c", f"context={json.dumps(context, ensure_ascii=False)}"])
-        if tools:
-            command.extend(["-c", f"allowed_tools={json.dumps(tools, ensure_ascii=False)}"])
-        command.append(user_prompt)
+        if isinstance(requested_model, str) and requested_model.strip():
+            command.extend(["-m", requested_model.strip()])
+        command.append(rendered_prompt)
         return command
+
+    @staticmethod
+    def _build_user_prompt(
+        user_prompt: str,
+        context: dict[str, Any],
+        tools: list[str] | None,
+    ) -> str:
+        parts = [user_prompt]
+        if context:
+            parts.append("Context JSON:")
+            parts.append(json.dumps(context, ensure_ascii=False, indent=2))
+        if tools:
+            parts.append("Allowed tools:")
+            parts.append(json.dumps(tools, ensure_ascii=False))
+        return "\n\n".join(parts)
 
     @staticmethod
     def _extract_content(event: dict[str, Any]) -> str:
@@ -97,6 +111,7 @@ class CodexBackend(AgentBackend):
                 "command": command[:4],
                 "has_context": bool(context),
                 "tool_mode": bool(tools),
+                "model": context.get("model"),
             }
         )
         try:
@@ -134,7 +149,6 @@ class CodexBackend(AgentBackend):
                     continue
                 parse_buffer = ""
                 self._emit({"event": "codex_json_parse_fallback", "line": line[:200]})
-                yield line
                 continue
 
             content = self._extract_content(event)
@@ -150,7 +164,6 @@ class CodexBackend(AgentBackend):
 
         if parse_buffer:
             self._emit({"event": "codex_json_buffer_flush", "bytes": len(parse_buffer)})
-            yield parse_buffer
 
         return_code = await process.wait()
         stderr_output = ""

@@ -65,6 +65,12 @@ class CodexSDKBackend(AgentBackend):
         context: dict[str, Any],
         tools: list[str] | None = None,
     ) -> AsyncIterator[str]:
+        requested_model = context.get("model")
+        model_name = (
+            requested_model.strip()
+            if isinstance(requested_model, str) and requested_model.strip()
+            else self.model
+        )
         if self._client is None:
             async for chunk in self.cli_fallback.execute(
                 system_prompt,
@@ -79,7 +85,7 @@ class CodexSDKBackend(AgentBackend):
 
         def _request() -> Any:
             return self._client.responses.create(
-                model=self.model,
+                model=model_name,
                 input=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},

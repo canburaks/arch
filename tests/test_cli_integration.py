@@ -207,6 +207,144 @@ def test_accept_rejects_forbidden_paths(tmp_path: Path, monkeypatch) -> None:
     assert "forbidden path" in accept_result.output.lower()
 
 
+def test_init_detects_node_profile_from_package_json(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    (repo / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "sample",
+                "scripts": {
+                    "test": "vitest",
+                    "lint": "eslint .",
+                    "typecheck": "tsc --noEmit",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(repo)
+    runner = CliRunner()
+    init_result = runner.invoke(cli, ["init"])
+
+    assert init_result.exit_code == 0
+    config = load_config(repo / "architect.toml")
+    assert config.project.language == "javascript"
+    assert config.project.test_command == "npm run test"
+    assert config.project.lint_command == "npm run lint"
+    assert config.project.type_check_command == "npm run typecheck"
+    assert config.workflow.auto_test is True
+    assert config.workflow.auto_lint is True
+    assert "**/*.ts" in config.guardrails.require_tests_for
+
+
+def test_init_does_not_override_existing_config(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    (repo / "package.json").write_text(
+        json.dumps({"name": "sample", "scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    config_path = repo / "architect.toml"
+    config = load_config(config_path)
+    config.project.language = "python"
+    config.project.test_command = "python -m pytest -q"
+    config.project.lint_command = "python -m compileall src tests"
+    config.project.type_check_command = "python -m compileall src tests"
+    save_config(config_path, config)
+
+    monkeypatch.chdir(repo)
+    runner = CliRunner()
+    init_result = runner.invoke(cli, ["init"])
+
+    assert init_result.exit_code == 0
+    loaded = load_config(config_path)
+    assert loaded.project.language == "python"
+    assert loaded.project.test_command == "python -m pytest -q"
+
+
+def test_init_detects_go_profile_from_go_mod(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    (repo / "go.mod").write_text("module example.com/aiteam\n\ngo 1.22\n", encoding="utf-8")
+
+    monkeypatch.chdir(repo)
+    runner = CliRunner()
+    init_result = runner.invoke(cli, ["init"])
+
+    assert init_result.exit_code == 0
+    config = load_config(repo / "architect.toml")
+    assert config.project.language == "go"
+    assert config.project.test_command == "go test ./..."
+    assert config.project.lint_command == "go vet ./..."
+    assert config.project.type_check_command == "go test ./..."
+    assert config.guardrails.require_tests_for == ["**/*.go"]
+
+
+def test_init_detects_rust_profile_from_cargo_toml(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    (repo / "Cargo.toml").write_text(
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(repo)
+    runner = CliRunner()
+    init_result = runner.invoke(cli, ["init"])
+
+    assert init_result.exit_code == 0
+    config = load_config(repo / "architect.toml")
+    assert config.project.language == "rust"
+    assert config.project.test_command == "cargo test"
+    assert config.project.lint_command == "cargo check --all-targets --all-features"
+    assert config.project.type_check_command == "cargo check --all-targets --all-features"
+    assert config.guardrails.require_tests_for == ["**/*.rs"]
+
+
+def test_cli_non_git_lifecycle_is_supported(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        "architect.cli._build_backend", lambda config, repo_root, state: FakeBackend()
+    )
+    runner = CliRunner()
+
+    init_result = runner.invoke(cli, ["init"])
+    assert init_result.exit_code == 0
+    _set_safe_commands(repo / "architect.toml")
+
+    run_result = runner.invoke(cli, ["run", "Implement workflow"])
+    assert run_result.exit_code == 0
+
+    review_result = runner.invoke(cli, ["review"])
+    assert review_result.exit_code == 0
+    patch_id = _extract_patch_id(review_result.output)
+    assert patch_id.startswith("patch-local-")
+
+    accept_result = runner.invoke(cli, ["accept", patch_id])
+    assert accept_result.exit_code == 0
+
+    reject_result = runner.invoke(cli, ["reject", patch_id])
+    assert reject_result.exit_code == 0
+    assert "Queued retry task" in reject_result.output
+
+    checkpoints_result = runner.invoke(cli, ["checkpoints"])
+    assert checkpoints_result.exit_code == 0
+    checkpoint_id = _extract_checkpoint_id(checkpoints_result.output)
+
+    rollback_result = runner.invoke(cli, ["rollback", checkpoint_id])
+    assert rollback_result.exit_code == 0
+    assert "local/" in rollback_result.output
+
+
 def test_pause_resume_and_resume_from_checkpoint(tmp_path: Path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
