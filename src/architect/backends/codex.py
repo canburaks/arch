@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -10,9 +10,19 @@ from architect.backends.base import AgentBackend, BackendExecutionError, Backend
 
 
 class CodexBackend(AgentBackend):
-    def __init__(self, binary: str = "codex", working_directory: Path | None = None) -> None:
+    def __init__(
+        self,
+        binary: str = "codex",
+        working_directory: Path | None = None,
+        event_hook: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.binary = binary
         self.working_directory = working_directory
+        self.event_hook = event_hook
+
+    def _emit(self, payload: dict[str, Any]) -> None:
+        if self.event_hook is not None:
+            self.event_hook(payload)
 
     def build_command(
         self,
@@ -76,10 +86,23 @@ class CodexBackend(AgentBackend):
         tools: list[str] | None = None,
     ) -> AsyncIterator[str]:
         command = self.build_command(system_prompt, user_prompt, context, tools)
+        cwd_override = context.get("_working_directory")
+        if isinstance(cwd_override, str) and cwd_override.strip():
+            cwd = cwd_override
+        else:
+            cwd = str(self.working_directory) if self.working_directory else None
+        self._emit(
+            {
+                "event": "codex_cli_start",
+                "command": command[:4],
+                "has_context": bool(context),
+                "tool_mode": bool(tools),
+            }
+        )
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
-                cwd=str(self.working_directory) if self.working_directory else None,
+                cwd=cwd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -107,16 +130,26 @@ class CodexBackend(AgentBackend):
             except json.JSONDecodeError:
                 if self._appears_partial_json(candidate):
                     parse_buffer = candidate
+                    self._emit({"event": "codex_json_partial", "bytes": len(candidate)})
                     continue
                 parse_buffer = ""
+                self._emit({"event": "codex_json_parse_fallback", "line": line[:200]})
                 yield line
                 continue
 
             content = self._extract_content(event)
+            self._emit(
+                {
+                    "event": "codex_json_event",
+                    "type": str(event.get("type", "")),
+                    "has_content": bool(content),
+                }
+            )
             if content:
                 yield content
 
         if parse_buffer:
+            self._emit({"event": "codex_json_buffer_flush", "bytes": len(parse_buffer)})
             yield parse_buffer
 
         return_code = await process.wait()
@@ -124,12 +157,20 @@ class CodexBackend(AgentBackend):
         if process.stderr is not None:
             stderr_output = (await process.stderr.read()).decode("utf-8", errors="replace").strip()
         if return_code != 0:
+            self._emit(
+                {
+                    "event": "codex_cli_exit",
+                    "exit_code": return_code,
+                    "stderr": stderr_output[:400],
+                }
+            )
             raise BackendExecutionError(
                 f"Codex backend failed with exit code {return_code}: {stderr_output}",
                 backend="codex",
                 exit_code=return_code,
                 retriable=True,
             )
+        self._emit({"event": "codex_cli_exit", "exit_code": 0})
 
     async def execute_with_tools(
         self,

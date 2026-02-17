@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 import subprocess
@@ -66,6 +67,14 @@ class PatchStackManager:
         if check and proc.returncode != 0:
             raise ArchitectStateError(proc.stderr.strip() or proc.stdout.strip())
         return proc
+
+    @staticmethod
+    def _matches_forbidden_path(path: str, patterns: list[str]) -> str | None:
+        normalized = path.replace("\\", "/")
+        for pattern in patterns:
+            if fnmatch.fnmatch(normalized, pattern):
+                return pattern
+        return None
 
     @staticmethod
     def _patch_id_for_commit(commit_hash: str) -> str:
@@ -331,6 +340,29 @@ class PatchStackManager:
         metrics["patch_stack"] = stack
         self.state_store.set_metrics(metrics)
 
+    def update_patch_metadata(self, commit_hash: str, updates: dict[str, Any]) -> None:
+        if self.state_store is None:
+            return
+        metrics = self.state_store.get_metrics()
+        stack = metrics.get("patch_stack", [])
+        if not isinstance(stack, list):
+            return
+
+        changed = False
+        for item in stack:
+            if not isinstance(item, dict):
+                continue
+            if item.get("commit_hash") != commit_hash:
+                continue
+            item.update(updates)
+            item["updated_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+            changed = True
+            break
+
+        if changed:
+            metrics["patch_stack"] = stack
+            self.state_store.set_metrics(metrics)
+
     def create_task_patch(
         self, artifact_path: Path, *, subject: str, body: str, task_id: str, run_id: str
     ) -> Patch:
@@ -348,6 +380,27 @@ class PatchStackManager:
             return []
         return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
+    def _validate_precommit_guardrails(
+        self,
+        staged_files: list[str],
+        *,
+        max_files: int | None,
+        forbidden_paths: list[str] | None,
+    ) -> None:
+        if max_files is not None and len(staged_files) > max_files:
+            raise ArchitectStateError(
+                "Pre-commit guardrail failed: "
+                f"{len(staged_files)} files staged (max {max_files})."
+            )
+        if forbidden_paths:
+            for file_path in staged_files:
+                matched = self._matches_forbidden_path(file_path, forbidden_paths)
+                if matched:
+                    raise ArchitectStateError(
+                        "Pre-commit guardrail failed: forbidden path "
+                        f"'{file_path}' matched '{matched}'."
+                    )
+
     def create_task_patch_from_worktree(
         self,
         *,
@@ -357,21 +410,46 @@ class PatchStackManager:
         run_id: str,
         fallback_file: Path | None = None,
         fallback_content: str | None = None,
+        fallback_mode: str = "tracked",
+        max_files: int | None = None,
+        forbidden_paths: list[str] | None = None,
     ) -> Patch:
         if not self.git_enabled:
             raise ArchitectStateError("Creating a patch requires a git repository.")
         self._run_git(["add", "-A", "--", ".", ":(exclude).architect/**"], check=True)
         staged = self._staged_files()
         if not staged:
-            if fallback_file is None or fallback_content is None:
-                raise ArchitectStateError("No repository changes detected for patch creation.")
-            fallback_file.parent.mkdir(parents=True, exist_ok=True)
-            fallback_file.write_text(fallback_content, encoding="utf-8")
-            rel_path = fallback_file.relative_to(self.repo_root)
-            self._run_git(["add", str(rel_path)], check=True)
-            staged = self._staged_files()
-            if not staged:
-                raise ArchitectStateError("Failed to stage fallback patch artifact.")
+            if fallback_mode == "tracked":
+                if fallback_file is None or fallback_content is None:
+                    raise ArchitectStateError("No repository changes detected for patch creation.")
+                fallback_file.parent.mkdir(parents=True, exist_ok=True)
+                fallback_file.write_text(fallback_content, encoding="utf-8")
+                rel_path = fallback_file.relative_to(self.repo_root)
+                self._run_git(["add", str(rel_path)], check=True)
+                staged = self._staged_files()
+                if not staged:
+                    raise ArchitectStateError("Failed to stage fallback patch artifact.")
+            elif fallback_mode == "local_only":
+                if fallback_file is not None and fallback_content is not None:
+                    fallback_file.parent.mkdir(parents=True, exist_ok=True)
+                    fallback_file.write_text(fallback_content, encoding="utf-8")
+                self._run_git(["commit", "--allow-empty", "-m", subject, "-m", body], check=True)
+                commit_hash = self._run_git(["rev-parse", "HEAD"], check=True).stdout.strip()
+                return self.record_patch(
+                    commit_hash,
+                    subject,
+                    task_id,
+                    status="pending",
+                    run_id=run_id,
+                )
+            else:
+                raise ArchitectStateError(f"Unsupported fallback artifact mode: {fallback_mode}")
+
+        self._validate_precommit_guardrails(
+            staged,
+            max_files=max_files,
+            forbidden_paths=forbidden_paths,
+        )
         self._run_git(["commit", "-m", subject, "-m", body], check=True)
         commit_hash = self._run_git(["rev-parse", "HEAD"], check=True).stdout.strip()
         return self.record_patch(commit_hash, subject, task_id, status="pending", run_id=run_id)
@@ -392,7 +470,12 @@ class PatchStackManager:
         )
         if revert_proc.returncode != 0:
             self._run_git(["revert", "--abort"], check=False)
-            raise ArchitectStateError("Reject failed due to revert conflict. Resolve manually.")
+            self.update_patch_status(
+                patch.commit_hash,
+                "rejected",
+                note="Rejected without auto-revert due to conflict",
+            )
+            return patch
 
         self.update_patch_status(
             patch.commit_hash,
@@ -459,3 +542,26 @@ class PatchStackManager:
         )
         self._run_git(["checkout", "-b", rollback_branch, checkpoint_id], check=True)
         return rollback_branch
+
+    def finalize_accepted_patch(self, patch: Patch, *, strategy: str) -> dict[str, Any]:
+        if not self.git_enabled:
+            return {"strategy": "local-only", "tag": None}
+
+        sanitized_patch_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", patch.patch_id)
+        tag_name = f"architect/accepted/{sanitized_patch_id}"
+        self._run_git(["tag", "-f", tag_name, patch.commit_hash], check=True)
+        result: dict[str, Any] = {
+            "strategy": strategy,
+            "tag": tag_name,
+            "commit_hash": patch.commit_hash,
+            "finalized_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        }
+
+        if strategy == "single_branch_queue":
+            queue_ref = "refs/heads/architect/accepted-queue"
+            current = self._run_git(["rev-parse", "HEAD"], check=True).stdout.strip()
+            self._run_git(["update-ref", queue_ref, current], check=True)
+            result["queue_ref"] = queue_ref
+            result["queue_head"] = current
+
+        return result

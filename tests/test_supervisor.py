@@ -31,6 +31,9 @@ class FakeBackend(AgentBackend):
         if "Design a technical approach" in user_prompt:
             yield "- Implement core flow\n- Add validation"
             return
+        if "Review the following plan" in user_prompt:
+            yield "MINOR: Plan quality acceptable"
+            return
         if "Review quality/security" in user_prompt or "Review implementation chunk" in user_prompt:
             yield "MINOR: Naming could be improved"
             return
@@ -44,6 +47,21 @@ class FakeBackend(AgentBackend):
     ) -> dict[str, Any]:
         _ = system_prompt, user_prompt, allowed_tools
         return {"content": "ok"}
+
+
+class BlockingPlanCriticBackend(FakeBackend):
+    async def execute(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        context: dict[str, Any],
+        tools: list[str] | None = None,
+    ) -> AsyncIterator[str]:
+        if "Review the following plan" in user_prompt:
+            yield "BLOCKER: Missing interface definitions"
+            return
+        async for chunk in super().execute(system_prompt, user_prompt, context, tools):
+            yield chunk
 
 
 def _init_git_repo(repo_path: Path) -> None:
@@ -75,19 +93,23 @@ def _init_git_repo(repo_path: Path) -> None:
     )
 
 
-def _build_supervisor(repo: Path, config: ArchitectConfig) -> Supervisor:
-    backend = FakeBackend()
+def _build_supervisor(
+    repo: Path,
+    config: ArchitectConfig,
+    backend: AgentBackend | None = None,
+) -> Supervisor:
+    runtime_backend = backend or FakeBackend()
     state = GitNotesStore(repo)
     patches = PatchStackManager(repo, state_store=state)
     return Supervisor(
         state_store=state,
         patch_manager=patches,
         specialists={
-            "planner": PlannerAgent(backend),
-            "coder": CoderAgent(backend),
-            "tester": TesterAgent(backend),
-            "critic": CriticAgent(backend),
-            "documenter": DocumenterAgent(backend),
+            "planner": PlannerAgent(runtime_backend),
+            "coder": CoderAgent(runtime_backend),
+            "tester": TesterAgent(runtime_backend),
+            "critic": CriticAgent(runtime_backend),
+            "documenter": DocumenterAgent(runtime_backend),
         },
         config=config,
         repo_root=repo,
@@ -114,6 +136,14 @@ def test_supervisor_run_updates_state_and_creates_patches(tmp_path: Path) -> Non
     assert len(status["metrics"]["quality_gates"]) >= 5
     assert any(task["type"] == "implement" for task in status["tasks"])
     assert len(status["patches"]) >= 1
+    tracked_fallback = subprocess.run(
+        ["git", "ls-files", "docs/architect-runs"],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    assert tracked_fallback == ""
 
 
 def test_supervisor_fails_when_test_gate_command_fails(tmp_path: Path) -> None:
@@ -162,3 +192,38 @@ def test_supervisor_can_skip_critic_when_not_required(tmp_path: Path) -> None:
 
     assert summary.completed_tasks >= 4
     assert not any(task["type"] == "review" for task in status["tasks"])
+
+
+def test_supervisor_records_runs_and_leases(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    config = ArchitectConfig.default()
+    config.project.lint_command = "python -c \"print('lint ok')\""
+    config.project.type_check_command = "python -c \"print('type ok')\""
+    config.project.test_command = "python -c \"print('test ok')\""
+    supervisor = _build_supervisor(repo, config)
+
+    summary = asyncio.run(supervisor.run("Build JWT auth"))
+    payload = supervisor.status(verbose=True)
+
+    assert summary.run_id in payload["runs"]
+    assert payload["runs"][summary.run_id]["status"] == "complete"
+    assert "active" in payload["leases"]
+
+
+def test_plan_gate_can_enforce_critic_blockers(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    config = ArchitectConfig.default()
+    config.workflow.plan_requires_critic = True
+    config.project.lint_command = "python -c \"print('lint ok')\""
+    config.project.type_check_command = "python -c \"print('type ok')\""
+    config.project.test_command = "python -c \"print('test ok')\""
+    supervisor = _build_supervisor(repo, config, backend=BlockingPlanCriticBackend())
+
+    with pytest.raises(RuntimeError, match="Planning gate failed due to critic blockers"):
+        asyncio.run(supervisor.run("Build JWT auth"))

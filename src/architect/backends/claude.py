@@ -48,6 +48,11 @@ class ClaudeCodeBackend(AgentBackend):
         context: dict[str, Any],
         tools: list[str] | None = None,
     ) -> AsyncIterator[str]:
+        cwd_override = context.get("_working_directory")
+        if isinstance(cwd_override, str) and cwd_override.strip():
+            cwd = cwd_override
+        else:
+            cwd = str(self.working_directory) if self.working_directory else None
         if context:
             user_prompt = (
                 f"{user_prompt}\n\nContext JSON:\n"
@@ -69,7 +74,7 @@ class ClaudeCodeBackend(AgentBackend):
             try:
                 process = await asyncio.create_subprocess_exec(
                     *command,
-                    cwd=str(self.working_directory) if self.working_directory else None,
+                    cwd=cwd,
                     env=env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,

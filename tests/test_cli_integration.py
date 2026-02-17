@@ -1,3 +1,4 @@
+import json
 import re
 import subprocess
 from collections.abc import AsyncIterator
@@ -88,6 +89,10 @@ def _extract_checkpoint_id(checkpoints_output: str) -> str:
     return lines[-1]
 
 
+def _run_git(cmd: list[str], cwd: Path) -> str:
+    return subprocess.run(cmd, cwd=cwd, check=True, text=True, capture_output=True).stdout.strip()
+
+
 def test_cli_full_lifecycle_commands(tmp_path: Path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -123,10 +128,21 @@ def test_cli_full_lifecycle_commands(tmp_path: Path, monkeypatch) -> None:
 
     accept_result = runner.invoke(cli, ["accept", patch_id])
     assert accept_result.exit_code == 0
+    tags = _run_git(["git", "tag", "--list", "architect/accepted/*"], cwd=repo).splitlines()
+    assert f"architect/accepted/{patch_id}" in tags
+    accepted_status = runner.invoke(cli, ["status", "--verbose"])
+    assert accepted_status.exit_code == 0
+    accepted_payload = json.loads(accepted_status.output)
+    finalized = [
+        patch
+        for patch in accepted_payload["metrics"].get("patch_stack", [])
+        if patch.get("patch_id") == patch_id
+    ]
+    assert finalized and "finalization" in finalized[0]
 
     modify_result = runner.invoke(cli, ["modify", patch_id])
     assert modify_result.exit_code == 0
-    assert "Amendment branch:" in modify_result.output
+    assert "Marked" in modify_result.output
 
     second_run_result = runner.invoke(cli, ["run", "Implement second workflow"])
     assert second_run_result.exit_code == 0
@@ -139,6 +155,13 @@ def test_cli_full_lifecycle_commands(tmp_path: Path, monkeypatch) -> None:
 
     reject_result = runner.invoke(cli, ["reject", second_patch_id])
     assert reject_result.exit_code == 0
+    assert "Queued retry task" in reject_result.output
+
+    status_after_reject = runner.invoke(cli, ["status", "--verbose"])
+    assert status_after_reject.exit_code == 0
+    status_payload = json.loads(status_after_reject.output)
+    task_ids = [task["id"] for task in status_payload["tasks"]]
+    assert any(task_id.startswith("task-retry-") for task_id in task_ids)
 
     checkpoints_result = runner.invoke(cli, ["checkpoints"])
     assert checkpoints_result.exit_code == 0

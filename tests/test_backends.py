@@ -3,6 +3,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from architect.backends import RetryPolicy
 from architect.backends.base import AgentBackend, BackendExecutionError
 from architect.backends.claude import ClaudeCodeBackend
@@ -127,3 +129,61 @@ def test_resilient_backend_execute_with_tools_fallback() -> None:
     event_names = [event["event"] for event in events]
     assert "backend_retry" in event_names
     assert "backend_fallback_success" in event_names
+
+
+def test_codex_backend_emits_stream_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[dict[str, Any]] = []
+
+    class FakeStdout:
+        def __init__(self, lines: list[bytes]) -> None:
+            self._lines = lines
+            self._index = 0
+
+        def __aiter__(self) -> "FakeStdout":
+            return self
+
+        async def __anext__(self) -> bytes:
+            if self._index >= len(self._lines):
+                raise StopAsyncIteration
+            line = self._lines[self._index]
+            self._index += 1
+            return line
+
+    class FakeStderr:
+        async def read(self) -> bytes:
+            return b""
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = FakeStdout(
+                [
+                    b"{\"type\":\"response.output_text.delta\",\"content\":\"hello\"}\n",
+                    b"{\"type\":\"response.completed\"}\n",
+                ]
+            )
+            self.stderr = FakeStderr()
+
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> FakeProcess:
+        _ = args, kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    backend = CodexBackend(event_hook=events.append)
+
+    async def _run() -> str:
+        chunks: list[str] = []
+        async for chunk in backend.execute("system", "user", context={}):
+            chunks.append(chunk)
+        return "".join(chunks)
+
+    output = asyncio.run(_run())
+
+    assert output == "hello"
+    event_names = [event.get("event") for event in events]
+    assert "codex_cli_start" in event_names
+    assert "codex_json_event" in event_names
+    assert "codex_cli_exit" in event_names
