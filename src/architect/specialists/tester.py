@@ -4,6 +4,7 @@ from architect.specialists.base import SpecialistAgent
 
 
 class TesterAgent(SpecialistAgent):
+    __test__ = False
     role = "tester"
     prompt_file = "tester.md"
     fallback_prompt = """

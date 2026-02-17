@@ -6,6 +6,7 @@ import pytest
 
 from architect.state import GitNotesStore, PatchStackManager
 from architect.state.git_notes import ArchitectStateError
+from architect.state.patches import Patch
 
 
 def _run(cmd: list[str], cwd: Path) -> str:
@@ -45,6 +46,30 @@ def test_patch_ids_are_stable_and_resolvable(tmp_path: Path) -> None:
     resolved_legacy = manager.resolve_patch("patch-001")
     assert resolved_legacy is not None
     assert resolved_legacy.commit_hash == first_list[0].commit_hash
+
+
+def test_resolve_patch_accepts_numeric_hash_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo_with_commits(repo)
+
+    state = GitNotesStore(repo)
+    manager = PatchStackManager(repo, state_store=state)
+    numeric_patch = Patch(
+        patch_id="patch-12345678",
+        commit_hash="1234567890abcdef1234567890abcdef12345678",
+        subject="synthetic patch",
+    )
+
+    def _fake_list_patches(*_: object, **__: object) -> list[Patch]:
+        return [numeric_patch]
+
+    monkeypatch.setattr(manager, "list_patches", _fake_list_patches)
+
+    resolved = manager.resolve_patch(numeric_patch.patch_id)
+    assert resolved is numeric_patch
 
 
 def test_patch_status_persisted_in_state(tmp_path: Path) -> None:

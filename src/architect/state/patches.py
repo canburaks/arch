@@ -260,13 +260,6 @@ class PatchStackManager:
     ) -> Patch | None:
         patches = self.list_patches(base_ref=base_ref, commit_hashes=commit_hashes)
 
-        # Legacy positional reference support.
-        if patch_ref.startswith("patch-") and patch_ref[6:].isdigit():
-            patch_index = int(patch_ref.split("-", maxsplit=1)[1]) - 1
-            if 0 <= patch_index < len(patches):
-                return patches[patch_index]
-            return None
-
         for patch in patches:
             if patch.patch_id == patch_ref:
                 return patch
@@ -274,6 +267,12 @@ class PatchStackManager:
                 return patch
             if patch.patch_id.startswith(patch_ref):
                 return patch
+
+        # Legacy positional reference support (e.g. patch-001).
+        if re.fullmatch(r"patch-\d{3}", patch_ref):
+            patch_index = int(patch_ref.split("-", maxsplit=1)[1]) - 1
+            if 0 <= patch_index < len(patches):
+                return patches[patch_index]
         return None
 
     def changed_files_for_commit(self, commit_hash: str) -> list[str]:
